@@ -1,10 +1,10 @@
 //! Клиент: типизированные операции над машиной, куда бы она ни была
 //! подключена.
 //!
-//! Соединение одно и живёт долго: ssh поднимается однажды, а не на каждый
-//! чих, и все операции идут по нему вперемешку — у каждой свой `id`. Когда
-//! машина своя, соединения нет вовсе: те же операции исполняются прямо в
-//! процессе, и ветка «локально одно, удалённо другое» не заводится.
+//! Соединение одно и живёт долго: рукопожатие случается однажды, а не на
+//! каждый чих, и все операции идут по нему вперемешку — у каждой свой `id`.
+//! Когда машина своя, соединения нет вовсе: те же операции исполняются
+//! прямо в процессе, и ветка «локально одно, удалённо другое» не заводится.
 
 use std::{
     collections::HashMap,
@@ -16,7 +16,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
 };
 
@@ -24,10 +24,11 @@ use crate::{
     limits::Limits,
     ops::Ops,
     proto::{self, Answer, Code, Entry, Failure, Op, Reply, Request, Response},
+    transport::{self, Endpoint},
 };
 
-/// Сколько ждём рукопожатия. Столько же занимает ssh-подключение к живой
-/// машине; дольше — значит, на той стороне что-то не то.
+/// Сколько ждём рукопожатия. Столько же занимает соединение с живой
+/// машиной; дольше — значит, на той стороне что-то не то.
 const HANDSHAKE: Duration = Duration::from_secs(20);
 
 /// Сколько ждём ответа на файловую операцию.
@@ -36,15 +37,12 @@ const FILE_WAIT: Duration = Duration::from_secs(120);
 /// Запас ожидания поверх таймаута команды: доставка, форк, обратный путь.
 const EXEC_MARGIN: Duration = Duration::from_secs(15);
 
-/// Сколько ругани ssh запоминаем, чтобы показать её в отказе.
-const NOISE_CAP: usize = 4096;
-
 /// Отказ. Развилка ровно одна и она важная: руки недоступны — можно
 /// пробовать другой путь; операция не удалась — это ответ машины, и врать
 /// поверх него нельзя.
 #[derive(Debug)]
 pub enum Error {
-    /// Демона нет, соединение не встало или оборвалось.
+    /// Демон не отвечает, ключ не принят или соединение оборвалось.
     Unavailable(String),
     /// Операция не удалась на той стороне.
     Failed(Failure),
@@ -75,17 +73,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Куда и как запускать демон по ssh.
-#[derive(Debug, Clone)]
-pub struct SshTarget {
-    /// `[user@]host` или алиас из ssh_config.
-    pub destination: String,
-    /// Дополнительные аргументы ssh: identity, порт, known_hosts.
-    pub args: Vec<String>,
-    /// Чем зовётся демон на той стороне.
-    pub command: String,
-}
-
 /// Что машина сказала о себе на рукопожатии.
 #[derive(Debug, Clone)]
 pub struct Greeting {
@@ -104,7 +91,7 @@ impl std::fmt::Debug for Hands {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.backend {
             Backend::Local(_) => f.write_str("hands on this machine"),
-            Backend::Ssh(ssh) => write!(f, "hands on {} over ssh", ssh.target.destination),
+            Backend::Remote(remote) => write!(f, "hands at {}", remote.endpoint.address),
             Backend::Wired(conn) => write!(f, "hands on {}", conn.greeting.host),
         }
     }
@@ -113,9 +100,9 @@ impl std::fmt::Debug for Hands {
 enum Backend {
     /// Машина своя — исполняем прямо здесь.
     Local(Arc<Ops>),
-    /// Машина за ssh; соединение поднимается лениво и переживает разрывы.
-    Ssh(Ssh),
-    /// Готовое соединение: юникс-сокет или труба в тестах.
+    /// Машина за сетью; соединение поднимается лениво и переживает разрывы.
+    Remote(Remote),
+    /// Готовое соединение — в тестах.
     Wired(Arc<Conn>),
 }
 
@@ -125,31 +112,19 @@ impl Hands {
         Self { backend: Backend::Local(Arc::new(Ops::new(limits))) }
     }
 
-    /// Машина за ssh. Соединение поднимется при первой операции — здесь
-    /// ничего не запускается и ничего не может упасть.
-    pub fn ssh(target: SshTarget) -> Self {
-        Self {
-            backend: Backend::Ssh(Ssh { target, conn: tokio::sync::Mutex::new(None) }),
-        }
+    /// Машина за сетью. Соединение поднимется при первой операции — здесь
+    /// ничего не открывается и ничего не может упасть.
+    pub fn remote(endpoint: Endpoint) -> Self {
+        Self { backend: Backend::Remote(Remote { endpoint, conn: tokio::sync::Mutex::new(None) }) }
     }
 
-    /// Демон на юникс-сокете этой же машины.
-    pub async fn unix(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let stream = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(|error| Error::Unavailable(format!("{}: {error}", path.display())))?;
-        let (reader, writer) = stream.into_split();
-        Self::over(reader, writer).await
-    }
-
-    /// Готовые потоки к уже запущенному демону.
+    /// Готовые потоки к уже открытому каналу.
     pub async fn over<R, W>(reader: R, writer: W) -> Result<Self, Error>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let conn = Conn::start(reader, writer, Arc::default(), None).await?;
+        let conn = Conn::start(reader, writer, None).await?;
         Ok(Self { backend: Backend::Wired(Arc::new(conn)) })
     }
 
@@ -158,11 +133,11 @@ impl Hands {
         match &self.backend {
             Backend::Local(_) => None,
             Backend::Wired(conn) => Some(conn.greeting.clone()),
-            Backend::Ssh(ssh) => ssh.conn().await.ok().map(|conn| conn.greeting.clone()),
+            Backend::Remote(remote) => remote.conn().await.ok().map(|conn| conn.greeting.clone()),
         }
     }
 
-    /// Живы ли руки. Простаивающая ssh-труба умеет умирать молча, и
+    /// Живы ли руки. Простаивающее соединение умеет умирать молча, и
     /// спросить об этом дешевле, чем узнать посреди работы.
     pub async fn ping(&self) -> Result<(), Error> {
         self.call(None, Op::Ping, Vec::new(), HANDSHAKE).await.map(|_| ())
@@ -304,21 +279,18 @@ impl Hands {
                 ops.run(request, body).await.map_err(Error::Failed)
             }
             Backend::Wired(conn) => conn.call(cwd, op, body, wait).await,
-            Backend::Ssh(ssh) => {
-                let conn = ssh.conn().await?;
+            Backend::Remote(remote) => {
+                let conn = remote.conn().await?;
                 // повтор только для операций, которые ничего не меняют:
                 // соединение могло умереть по дороге, а переписывать файл
-                // дважды из-за оборванной трубы — не то, чего хочет никто
-                let retriable = retriable(&op);
-                let attempt = if retriable {
-                    conn.call(cwd, op.clone(), body.clone(), wait).await
-                } else {
+                // дважды из-за оборванного канала — не то, чего хочет никто
+                if !retriable(&op) {
                     return conn.call(cwd, op, body, wait).await;
-                };
-                match attempt {
+                }
+                match conn.call(cwd, op.clone(), body.clone(), wait).await {
                     Err(Error::Unavailable(_)) => {
-                        ssh.forget(&conn).await;
-                        let fresh = ssh.conn().await?;
+                        remote.forget(&conn).await;
+                        let fresh = remote.conn().await?;
                         fresh.call(cwd, op, body, wait).await
                     }
                     other => other,
@@ -351,14 +323,14 @@ fn mismatch(asked: &str, got: &Answer) -> Error {
     Error::Unavailable(format!("asked for {asked}, the machine answered {got:?}"))
 }
 
-struct Ssh {
-    target: SshTarget,
+struct Remote {
+    endpoint: Endpoint,
     conn: tokio::sync::Mutex<Option<Arc<Conn>>>,
 }
 
-impl Ssh {
+impl Remote {
     /// Живое соединение: поднимаем, если его нет или оно умерло. Под
-    /// замком, чтобы десять операций подряд не подняли десять ssh.
+    /// замком, чтобы десять операций подряд не подняли десять соединений.
     async fn conn(&self) -> Result<Arc<Conn>, Error> {
         let mut slot = self.conn.lock().await;
         if let Some(conn) = slot.as_ref()
@@ -366,7 +338,8 @@ impl Ssh {
         {
             return Ok(conn.clone());
         }
-        let fresh = Arc::new(Conn::ssh(&self.target).await?);
+        let link = transport::connect(&self.endpoint).await?;
+        let fresh = Arc::new(Conn::start(link.reader, link.writer, Some(link.session)).await?);
         *slot = Some(fresh.clone());
         Ok(fresh)
     }
@@ -381,66 +354,22 @@ impl Ssh {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(Answer, Vec<u8>), Error>>>>>;
 
-/// Соединение с демоном: пишущая труба, ждущие ответа и то, что успел
-/// сказать ssh, прежде чем всё пошло не так.
+/// Соединение с демоном: пишущая труба и ждущие ответа.
 struct Conn {
     out: mpsc::Sender<(Vec<u8>, Vec<u8>)>,
     pending: Pending,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
-    noise: Arc<Mutex<String>>,
     greeting: Greeting,
-    /// Живёт ради kill_on_drop: без него брошенный ssh остался бы висеть.
-    _child: Option<tokio::process::Child>,
+    /// Живёт ради соединения: пока ручка сессии цела, цел и канал.
+    _session: Option<russh::client::Handle<transport::Verifier>>,
 }
 
 impl Conn {
-    async fn ssh(target: &SshTarget) -> Result<Self, Error> {
-        use std::process::Stdio;
-
-        let mut cmd = tokio::process::Command::new("ssh");
-        cmd.arg("-oBatchMode=yes")
-            .arg("-oConnectTimeout=10")
-            // соединение живёт часами и простаивает: без ping'ов посредине
-            // NAT молча выбрасывает его, и разрыв обнаружится операцией
-            .arg("-oServerAliveInterval=30")
-            .arg("-oServerAliveCountMax=3")
-            .args(&target.args)
-            .arg("--")
-            .arg(&target.destination)
-            .arg(format!("{} serve", target.command))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|error| Error::Unavailable(format!("failed to start ssh: {error}")))?;
-
-        let reader = child.stdout.take().expect("stdout is piped");
-        let writer = child.stdin.take().expect("stdin is piped");
-        let noise: Arc<Mutex<String>> = Arc::default();
-        if let Some(mut stderr) = child.stderr.take() {
-            // ругань ssh («eva-hands: command not found») — единственное,
-            // что объяснит молчание вместо рукопожатия
-            let kept = noise.clone();
-            tokio::spawn(async move {
-                let mut buffer = Vec::new();
-                let _ = stderr.read_to_end(&mut buffer).await;
-                if let Ok(mut kept) = kept.lock() {
-                    kept.push_str(String::from_utf8_lossy(&buffer).trim());
-                    kept.truncate(NOISE_CAP);
-                }
-            });
-        }
-        Self::start(reader, writer, noise, Some(child)).await
-    }
-
     async fn start<R, W>(
         mut reader: R,
         writer: W,
-        noise: Arc<Mutex<String>>,
-        child: Option<tokio::process::Child>,
+        session: Option<russh::client::Handle<transport::Verifier>>,
     ) -> Result<Self, Error>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -453,10 +382,10 @@ impl Conn {
         .await
         {
             Ok(Ok(Some(frame))) => hello(&frame.header)?,
-            Ok(Ok(None)) => return Err(Error::Unavailable(said(&noise, "it said nothing"))),
-            Ok(Err(error)) => return Err(Error::Unavailable(said(&noise, &error.to_string()))),
+            Ok(Ok(None)) => return Err(Error::Unavailable("it said nothing".to_owned())),
+            Ok(Err(error)) => return Err(Error::Unavailable(error.to_string())),
             Err(_) => {
-                return Err(Error::Unavailable(said(&noise, "it did not answer the handshake")));
+                return Err(Error::Unavailable("it did not answer the handshake".to_owned()));
             }
         };
         if greeting.protocol != proto::PROTOCOL {
@@ -484,7 +413,6 @@ impl Conn {
 
         let waiting = pending.clone();
         let died = dead.clone();
-        let heard = noise.clone();
         let cap = greeting.limits.max_frame();
         tokio::spawn(async move {
             // и чистый конец, и обрыв означают одно: ответов больше не
@@ -501,19 +429,11 @@ impl Conn {
             for tx in orphans {
                 // оборванное соединение — не отказ операции: спрашивающий
                 // вправе пойти другим путём, а не объявить файл пропавшим
-                let _ = tx.send(Err(Error::Unavailable(said(&heard, "the connection went down"))));
+                let _ = tx.send(Err(Error::Unavailable("the connection went down".to_owned())));
             }
         });
 
-        Ok(Self {
-            out,
-            pending,
-            next: AtomicU64::new(1),
-            dead,
-            noise,
-            greeting,
-            _child: child,
-        })
+        Ok(Self { out, pending, next: AtomicU64::new(1), dead, greeting, _session: session })
     }
 
     fn is_dead(&self) -> bool {
@@ -528,7 +448,7 @@ impl Conn {
         wait: Duration,
     ) -> Result<(Answer, Vec<u8>), Error> {
         if self.is_dead() {
-            return Err(Error::Unavailable(said(&self.noise, "the connection is closed")));
+            return Err(Error::Unavailable("the connection is closed".to_owned()));
         }
         if body.len() as u64 > self.greeting.limits.max_frame() {
             return Err(Error::Failed(Failure::new(
@@ -550,12 +470,12 @@ impl Conn {
         }
         if self.out.send((header, body)).await.is_err() {
             self.forget(id);
-            return Err(Error::Unavailable(said(&self.noise, "the connection is closed")));
+            return Err(Error::Unavailable("the connection is closed".to_owned()));
         }
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(result)) => result,
             // отправитель исчез вместе с соединением
-            Ok(Err(_)) => Err(Error::Unavailable(said(&self.noise, "the connection went down"))),
+            Ok(Err(_)) => Err(Error::Unavailable("the connection went down".to_owned())),
             Err(_) => {
                 self.forget(id);
                 Err(Error::Unavailable(format!(
@@ -597,20 +517,11 @@ fn hello(header: &[u8]) -> Result<Greeting, Error> {
     }
 }
 
-/// Отказ вместе с тем, что успел сказать ssh: без его ругани «соединение
-/// закрылось» ничего не объясняет.
-fn said(noise: &Arc<Mutex<String>>, why: &str) -> String {
-    match noise.lock().ok().map(|noise| noise.trim().to_owned()) {
-        Some(text) if !text.is_empty() => format!("{why} ({text})"),
-        _ => why.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Руки на трубе: сервер и клиент в одном процессе, ssh не нужен.
+    /// Руки на трубе: сервер и клиент в одном процессе, без сети.
     async fn wired() -> Hands {
         let (mine, theirs) = tokio::io::duplex(1 << 20);
         let (read, write) = tokio::io::split(theirs);
@@ -622,7 +533,8 @@ mod tests {
     }
 
     fn sandbox(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("eva-hands-client-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("eva-hands-client-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -698,11 +610,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_machine_without_hands_says_so_and_quotes_the_noise() {
-        let hands = Hands::ssh(SshTarget {
-            destination: "eva-hands-test.invalid".into(),
-            args: vec!["-oProxyCommand=sh -c 'echo eva-hands: command not found >&2; exit 127'".into()],
-            command: "eva-hands".into(),
+    async fn a_machine_that_does_not_answer_is_unavailable() {
+        let hands = Hands::remote(Endpoint {
+            // 127.0.0.1:1 никем не занят, достучаться туда невозможно
+            address: "127.0.0.1:1".into(),
+            user: "eva".into(),
+            key: "/nonexistent/eva/key".into(),
+            host_key: None,
         });
         let error = hands.stat(None, "/etc/hosts").await.unwrap_err();
         assert!(error.is_unavailable(), "{error}");

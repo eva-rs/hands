@@ -42,15 +42,24 @@
         };
       }
     ) // {
-      # services.eva-hands: пакет в системный профиль (ssh-сессия зовёт
-      # `eva-hands serve` голым именем) плюс /etc/eva-hands.toml с потолками.
-      # Резидентный юнит поднимается только под `socket` — по ssh демон
-      # живёт ровно столько, сколько живёт соединение.
+      # services.eva-hands: демон, слушающий свой порт. Ssh-демон машины ни
+      # при чём — руки аутентифицируют сами, по ключам из authorized_keys.
       nixosModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.services.eva-hands;
           format = pkgs.formats.toml { };
-          configFile = format.generate "eva-hands.toml" cfg.settings;
+          keysFile =
+            if cfg.authorizedKeysFile != null then
+              cfg.authorizedKeysFile
+            else
+              pkgs.writeText "eva-hands.authorized_keys"
+                (lib.concatMapStrings (key: "${key}\n") cfg.authorizedKeys);
+          configFile = format.generate "eva-hands.toml" (cfg.settings // {
+            inherit (cfg) listen;
+            host_key = cfg.hostKeyFile;
+            authorized_keys = keysFile;
+          });
+          port = lib.toInt (lib.last (lib.splitString ":" cfg.listen));
         in
         {
           options.services.eva-hands = {
@@ -61,6 +70,53 @@
               default = self.packages.${pkgs.stdenv.hostPlatform.system}.eva-hands;
               defaultText = lib.literalExpression "eva-hands.packages.<system>.default";
               description = "Пакет демона.";
+            };
+
+            listen = lib.mkOption {
+              type = lib.types.str;
+              default = "0.0.0.0:2222";
+              description = ''
+                Адрес и порт демона. Внутрь пускает только ключ, поэтому
+                открытый порт сам по себе прав не даёт — но и лишним быть
+                не должен.
+              '';
+            };
+
+            openFirewall = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Открыть порт в firewall NixOS.";
+            };
+
+            authorizedKeys = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "ssh-ed25519 AAAA... eva-kernel" ];
+              description = ''
+                Публичные ключи, которым руки открываются. Уезжают в
+                общедоступный nix-store — это нормально, они публичные.
+                Приватный ключ живёт у ядра.
+              '';
+            };
+
+            authorizedKeysFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "/run/secrets/eva-hands-authorized-keys";
+              description = ''
+                Готовый файл ключей вместо списка — если он приезжает из
+                sops. Задан — список игнорируется.
+              '';
+            };
+
+            hostKeyFile = lib.mkOption {
+              type = lib.types.str;
+              default = "/var/lib/eva-hands/host_key";
+              description = ''
+                Ключ, которым машина представляется клиенту. Файла нет —
+                демон заведёт его при первом запуске; его публичную половину
+                (`eva-hands host-key`) клиент пинует у себя.
+              '';
             };
 
             settings = lib.mkOption {
@@ -75,20 +131,10 @@
               '';
               description = ''
                 Потолки машины, они же /etc/eva-hands.toml: max_read,
-                max_write, max_hits, max_output, exec,
-                exec_timeout_secs, exec_max_timeout_secs, roots.
-                Пустой roots — вся файловая система.
-              '';
-            };
-
-            socket = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              example = "/run/eva-hands/sock";
-              description = ''
-                Поднять резидентный демон на юникс-сокете по этому пути.
-                Нужен только клиенту на этой же машине; путь через ssh
-                демона не требует — там его запускает сама сессия.
+                max_write, max_hits, max_output, exec, exec_timeout_secs,
+                exec_max_timeout_secs, roots. Пустой roots — вся файловая
+                система. listen, host_key и authorized_keys задаются
+                своими опциями и подставляются сюда сами.
               '';
             };
 
@@ -96,32 +142,38 @@
               type = lib.types.str;
               default = "root";
               description = ''
-                Под кем работает резидентный демон. К ssh-пути отношения
-                не имеет: там демон работает под тем, кто вошёл по ключу.
+                Под кем работает демон. По умолчанию root: руки должны
+                доставать до тех же файлов, до которых доставал shell.
+                Сужают их settings.roots и settings.exec, а не отдельный
+                пользователь — ключ и так даёт ровно то, что даёт.
               '';
             };
 
             group = lib.mkOption {
               type = lib.types.str;
               default = "root";
-              description = "Группа резидентного демона; она же владеет сокетом.";
-            };
-
-            socketMode = lib.mkOption {
-              type = lib.types.str;
-              default = "0600";
-              description = "Права на сокете, восьмеричные.";
+              description = "Группа демона.";
             };
           };
 
           config = lib.mkIf cfg.enable {
-            # ssh запускает `eva-hands serve` голым именем: без системного
-            # профиля неинтерактивная сессия его не найдёт
+            assertions = [{
+              assertion = cfg.authorizedKeys != [ ] || cfg.authorizedKeysFile != null;
+              message = ''
+                services.eva-hands: без ключей демон не пустит никого и не
+                поднимется. Задай authorizedKeys или authorizedKeysFile.
+              '';
+            }];
+
+            # руками пользуется ядро, а посмотреть отпечаток ключа машины
+            # хозяину нужно с самой машины
             environment.systemPackages = [ cfg.package ];
             environment.etc."eva-hands.toml".source = configFile;
 
-            systemd.services.eva-hands = lib.mkIf (cfg.socket != null) {
-              description = "Руки Евы (юникс-сокет)";
+            networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ port ];
+
+            systemd.services.eva-hands = {
+              description = "Руки Евы";
               wantedBy = [ "multi-user.target" ];
               after = [ "network.target" ];
               # exec нужен системный профиль: дефолтный PATH юнита — голые
@@ -129,18 +181,14 @@
               path = [ "/run/current-system/sw" ];
               environment.RUST_LOG = lib.mkDefault "info";
               serviceConfig = {
-                ExecStart = lib.concatStringsSep " " [
-                  "${cfg.package}/bin/eva-hands daemon"
-                  "--listen ${lib.escapeShellArg cfg.socket}"
-                  "--config ${configFile}"
-                  "--mode ${cfg.socketMode}"
-                ];
+                ExecStart = "${cfg.package}/bin/eva-hands serve --config ${configFile}";
                 User = cfg.user;
                 Group = cfg.group;
                 Restart = "on-failure";
                 RestartSec = 5;
-                RuntimeDirectory = "eva-hands";
-                RuntimeDirectoryPreserve = true;
+                # ключ машины заводится сам и должен пережить перезапуск
+                StateDirectory = "eva-hands";
+                StateDirectoryMode = "0700";
               };
             };
           };
