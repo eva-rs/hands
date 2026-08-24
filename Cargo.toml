@@ -17,7 +17,7 @@ default = ["bin"]
 bin = ["dep:clap", "dep:base64", "eva/cli", "eva/tokio"]
 
 [dependencies]
-eva = { git = "https://git.desu.church/VienDesu/eva.git", rev = "90e3f510714c250e704ffd09441b396c0391d6a1" }
+eva = { git = "https://git.desu.church/VienDesu/eva.git" }
 eyre = "0.6"
 
 tokio = { version = "1", features = [

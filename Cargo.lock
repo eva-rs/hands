@@ -681,7 +681,7 @@ dependencies = [
 [[package]]
 name = "eva"
 version = "0.1.0"
-source = "git+https://git.desu.church/VienDesu/eva.git?rev=90e3f510714c250e704ffd09441b396c0391d6a1#90e3f510714c250e704ffd09441b396c0391d6a1"
+source = "git+https://git.desu.church/VienDesu/eva.git#504eb3f2df24618ef4e0fc04168ef8ffd4a086e7"
 dependencies = [
  "ahash",
  "auto_impl",
@@ -739,7 +739,7 @@ dependencies = [
 [[package]]
 name = "eva-macros"
 version = "0.1.0"
-source = "git+https://git.desu.church/VienDesu/eva.git?rev=90e3f510714c250e704ffd09441b396c0391d6a1#90e3f510714c250e704ffd09441b396c0391d6a1"
+source = "git+https://git.desu.church/VienDesu/eva.git#504eb3f2df24618ef4e0fc04168ef8ffd4a086e7"
 dependencies = [
  "heck",
  "proc-macro-error",
@@ -752,7 +752,7 @@ dependencies = [
 [[package]]
 name = "eva-utils"
 version = "0.1.0"
-source = "git+https://git.desu.church/VienDesu/eva.git?rev=90e3f510714c250e704ffd09441b396c0391d6a1#90e3f510714c250e704ffd09441b396c0391d6a1"
+source = "git+https://git.desu.church/VienDesu/eva.git#504eb3f2df24618ef4e0fc04168ef8ffd4a086e7"
 
 [[package]]
 name = "eyre"
