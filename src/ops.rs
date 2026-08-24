@@ -1,845 +1,889 @@
-//! Что руки умеют делать с машиной. Здесь нет ни сети, ни кадров — только
-//! файловая система и процессы, поэтому всё это одинаково работает и в
-//! демоне на той стороне ssh, и прямо в процессе клиента, когда машина
-//! своя.
+//! The operations engine: filesystem and processes, no network and no frames.
+//!
+//! The same code runs in the daemon and in-process for the local machine, so
+//! the behaviour is identical either way.
 
-use std::{
-    io,
-    os::unix::fs::PermissionsExt,
-    path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, UNIX_EPOCH},
-};
+use std::io::SeekFrom;
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
 
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    process::Command,
-};
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::process::Command;
 
-use crate::{
-    limits::Limits,
-    proto::{Answer, Code, Entry, Failure, Kind, Op, Request},
-};
+use crate::limits::Limits;
+use crate::proto::{Answer, Code, Entry, Failure, Kind, Op, Request};
+use crate::session::Sessions;
 
-/// Окно потокового поиска: файл идёт мимо кусками такого размера.
+/// Search window; matches on a window boundary are preserved by overlapping the
+/// next window by `pattern.len() - 1`.
 const CHUNK: usize = 1024 * 1024;
 
-/// Хвост имени временного файла — чтобы две записи подряд не столкнулись.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Руки: потолки машины и операции над ней.
 pub struct Ops {
     pub limits: Limits,
+    sessions: Arc<Sessions>,
 }
+
+type Outcome = Result<(Answer, Vec<u8>), Failure>;
 
 impl Ops {
     pub fn new(limits: Limits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            sessions: Sessions::new(),
+        }
     }
 
-    /// Исполнить запрос. Возвращает ответ и его тело (байты файла или
-    /// пустоту).
-    pub async fn run(&self, request: Request, body: Vec<u8>) -> Result<(Answer, Vec<u8>), Failure> {
+    pub async fn run(&self, request: Request, body: Vec<u8>) -> Outcome {
         let cwd = request.cwd.as_deref();
         match request.op {
             Op::Ping => Ok((Answer::Pong, Vec::new())),
-
             Op::Stat { path } => {
-                let at = self.resolve(cwd, &path)?;
-                Ok((Answer::Stat { entry: entry_at(&at).await? }, Vec::new()))
+                let path = self.resolve(cwd, &path)?;
+                Ok((
+                    Answer::Stat {
+                        entry: entry_at(&path).await?,
+                    },
+                    Vec::new(),
+                ))
             }
-
-            Op::List { path } => {
-                let at = self.resolve(cwd, &path)?;
-                let (entries, stopped) = self.list(&at).await?;
-                Ok((Answer::List { entries, stopped }, Vec::new()))
+            Op::List { path } => self.list(cwd, &path).await,
+            Op::Read { path, offset, len } => self.read(cwd, &path, offset, len).await,
+            Op::Write {
+                path,
+                create_dirs,
+                mode,
+            } => self.write(cwd, &path, &body, create_dirs, mode).await,
+            Op::WriteAt {
+                path,
+                offset,
+                truncate,
+            } => self.write_at(cwd, &path, offset, &body, truncate).await,
+            Op::Find { path, from, limit } => self.find(cwd, &path, &body, from, limit).await,
+            Op::Mkdir { path, parents } => self.mkdir(cwd, &path, parents).await,
+            Op::Remove { path, recursive } => self.remove(cwd, &path, recursive).await,
+            Op::Rename { from, to } => self.rename(cwd, &from, &to).await,
+            Op::Exec {
+                command,
+                timeout_ms,
+            } => self.exec(cwd, &command, timeout_ms, body).await,
+            Op::ExecStart { command } => {
+                let id = self.sessions.start(&self.limits, cwd, &command, body)?;
+                Ok((Answer::Started { session: id }, Vec::new()))
             }
-
-            Op::Read { path, offset, len } => {
-                let at = self.resolve(cwd, &path)?;
-                let (total, bytes) = self.read(&at, offset, len).await?;
-                Ok((Answer::Read { total, offset }, bytes))
+            Op::ExecPoll {
+                session,
+                max_wait_ms,
+            } => {
+                let handle = self
+                    .sessions
+                    .get(session)
+                    .ok_or_else(|| Failure::new(Code::NotFound, "no such session"))?;
+                let (stdout, stderr, alive, code) =
+                    handle.poll(Duration::from_millis(max_wait_ms)).await;
+                let mut body = Vec::with_capacity(4 + stdout.len() + stderr.len());
+                body.extend_from_slice(&(stdout.len() as u32).to_be_bytes());
+                body.extend_from_slice(&stdout);
+                body.extend_from_slice(&stderr);
+                Ok((Answer::Chunk { alive, code }, body))
             }
-
-            Op::Write { path, create_dirs, mode } => {
-                let at = self.resolve(cwd, &path)?;
-                let total = self.write(&at, &body, create_dirs, mode).await?;
-                Ok((Answer::Wrote { total }, Vec::new()))
-            }
-
-            Op::WriteAt { path, offset, truncate } => {
-                let at = self.resolve(cwd, &path)?;
-                let total = self.write_at(&at, offset, &body, truncate).await?;
-                Ok((Answer::Wrote { total }, Vec::new()))
-            }
-
-            Op::Find { path, from, limit } => {
-                let at = self.resolve(cwd, &path)?;
-                let (total, offsets, stopped) = self.find(&at, &body, from, limit, CHUNK).await?;
-                Ok((Answer::Find { total, offsets, stopped }, Vec::new()))
-            }
-
-            Op::Mkdir { path, parents } => {
-                let at = self.resolve(cwd, &path)?;
-                let made =
-                    if parents { fs::create_dir_all(&at).await } else { fs::create_dir(&at).await };
-                made.map_err(|error| io_fail(&at, &error))?;
+            Op::ExecInput { session } => {
+                let handle = self
+                    .sessions
+                    .get(session)
+                    .ok_or_else(|| Failure::new(Code::NotFound, "no such session"))?;
+                handle.write_stdin(&body).await?;
                 Ok((Answer::Done, Vec::new()))
             }
-
-            Op::Remove { path, recursive } => {
-                let at = self.resolve(cwd, &path)?;
-                self.remove(&at, recursive).await?;
+            Op::ExecKill { session } => {
+                if let Some(handle) = self.sessions.get(session) {
+                    handle.kill();
+                }
                 Ok((Answer::Done, Vec::new()))
             }
-
-            Op::Rename { from, to } => {
-                let source = self.resolve(cwd, &from)?;
-                let target = self.resolve(cwd, &to)?;
-                fs::rename(&source, &target)
-                    .await
-                    .map_err(|error| io_fail(&source, &error))?;
-                Ok((Answer::Done, Vec::new()))
-            }
-
-            Op::Exec { command, timeout_ms } => self.exec(cwd, &command, timeout_ms, body).await,
         }
     }
 
-    /// Путь так, как его видит машина: `~` разворачивается, относительный
-    /// считается от `cwd`, `..` разбирается, и результат обязан лежать в
-    /// разрешённых корнях.
-    ///
-    /// `~` разворачиваем сами: путь, ушедший в шелл в кавычках, оставался
-    /// тильдой как есть — и файл не находился по вине кавычек.
-    pub fn resolve(&self, cwd: Option<&str>, path: &str) -> Result<PathBuf, Failure> {
-        if path.trim().is_empty() {
-            return Err(Failure::invalid("path is empty"));
+    fn resolve(&self, cwd: Option<&str>, path: &str) -> Result<PathBuf, Failure> {
+        if path.is_empty() {
+            return Err(Failure::invalid("empty path"));
         }
-        let wanted = expand_home(path);
-        let full = if wanted.is_absolute() {
-            wanted
+        let expanded = expand_home(path);
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else if let Some(cwd) = cwd {
+            expand_home(cwd).join(expanded)
         } else {
-            let base = match cwd {
-                Some(dir) => expand_home(dir),
-                // без рабочего каталога — от каталога процесса, как это
-                // сделал бы и шелл в ssh-сессии
-                None => std::env::current_dir()
-                    .map_err(|error| Failure::new(Code::Io, error.to_string()))?,
-            };
-            base.join(wanted)
+            std::env::current_dir()
+                .map_err(|e| Failure::new(Code::Io, format!("no working directory: {e}")))?
+                .join(expanded)
         };
-        let normalized = normalize(&full);
-        if !self.limits.allows(&normalized) {
+        let normal = normalize(&joined);
+        if !self.limits.allows(&normal) {
             return Err(Failure::new(
                 Code::Denied,
-                format!("{}: outside the directories this machine hands out", normalized.display()),
+                format!("{} is outside the allowed roots", normal.display()),
             ));
         }
-        Ok(normalized)
+        Ok(normal)
     }
 
-    async fn list(&self, path: &Path) -> Result<(Vec<Entry>, bool), Failure> {
-        let mut dir = fs::read_dir(path).await.map_err(|error| io_fail(path, &error))?;
-        let mut entries = Vec::new();
-        let mut stopped = false;
-        while let Some(found) = dir.next_entry().await.map_err(|error| io_fail(path, &error))? {
-            if entries.len() as u64 >= self.limits.max_hits {
-                stopped = true;
-                break;
-            }
-            entries.push(entry_at(&found.path()).await?);
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok((entries, stopped))
-    }
-
-    /// Кусок файла и его полная длина. Смещение за концом — пустой кусок, а
-    /// не ошибка: спрашивающий видит `total` и сам решает, что это значит.
     async fn read(
         &self,
-        path: &Path,
+        cwd: Option<&str>,
+        path: &str,
         offset: u64,
         len: Option<u64>,
-    ) -> Result<(u64, Vec<u8>), Failure> {
-        let meta = fs::metadata(path).await.map_err(|error| io_fail(path, &error))?;
+    ) -> Outcome {
+        let path = self.resolve(cwd, path)?;
+        let meta = fs::metadata(&path).await.map_err(|e| io_fail(&path, e))?;
         if meta.is_dir() {
-            return Err(Failure::new(
-                Code::NotAFile,
-                format!("{}: is a directory, not a file", path.display()),
-            ));
+            return Err(Failure::new(Code::NotAFile, "is a directory"));
         }
         let total = meta.len();
-        let start = offset.min(total);
-        let want = len.unwrap_or(total - start).min(total - start);
+        let offset = offset.min(total);
+        let remaining = total - offset;
+        let want = len.map(|l| l.min(remaining)).unwrap_or(remaining);
         if want > self.limits.max_read {
             return Err(Failure::new(
                 Code::TooLarge,
-                format!(
-                    "{}: asked for {want} bytes, this machine hands out at most {} per read — \
-                     read it in windows",
-                    path.display(),
-                    self.limits.max_read
-                ),
+                format!("read of {want} bytes exceeds max_read {}", self.limits.max_read),
             ));
         }
-        let mut file = fs::File::open(path).await.map_err(|error| io_fail(path, &error))?;
-        file.seek(io::SeekFrom::Start(start))
-            .await
-            .map_err(|error| io_fail(path, &error))?;
-        let mut bytes = Vec::with_capacity(want as usize);
+
+        let mut file = fs::File::open(&path).await.map_err(|e| io_fail(&path, e))?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|e| io_fail(&path, e))?;
+        }
+        let mut buf = Vec::with_capacity(want as usize);
         file.take(want)
-            .read_to_end(&mut bytes)
+            .read_to_end(&mut buf)
             .await
-            .map_err(|error| io_fail(path, &error))?;
-        Ok((total, bytes))
+            .map_err(|e| io_fail(&path, e))?;
+
+        Ok((Answer::Read { total, offset }, buf))
     }
 
-    /// Файл целиком. Пишется через соседний временный файл и `rename`:
-    /// оборванная на середине запись иначе оставила бы обрубок вместо
-    /// прежнего содержимого.
     async fn write(
         &self,
-        path: &Path,
+        cwd: Option<&str>,
+        path: &str,
         data: &[u8],
         create_dirs: bool,
         mode: Option<u32>,
-    ) -> Result<u64, Failure> {
-        self.check_size(path, data.len() as u64)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| Failure::invalid(format!("{}: has no parent directory", path.display())))?;
-        if create_dirs {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|error| io_fail(parent, &error))?;
+    ) -> Outcome {
+        let path = self.resolve(cwd, path)?;
+        if data.len() as u64 > self.limits.max_write {
+            return Err(Failure::new(
+                Code::TooLarge,
+                format!(
+                    "write of {} bytes exceeds max_write {}",
+                    data.len(),
+                    self.limits.max_write
+                ),
+            ));
         }
-        // права переживают замену: временный файл рождается с umask демона
-        let existing = fs::metadata(path).await.ok().map(|meta| meta.permissions().mode());
-        let temp = parent.join(format!(
-            ".eva-hands.{}.{}.tmp",
-            std::process::id(),
-            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = write_temp(&temp, data, mode.or(existing)).await;
-        let renamed = match written {
-            Ok(()) => fs::rename(&temp, path).await.map_err(|error| io_fail(path, &error)),
-            Err(failure) => Err(failure),
+        if create_dirs
+            && let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| io_fail(parent, e))?;
+            }
+
+        let keep_mode = mode.or_else(|| existing_mode(&path));
+        let tmp = temp_sibling(&path);
+
+        let write_temp = async {
+            let mut file = fs::File::create(&tmp).await?;
+            file.write_all(data).await?;
+            file.sync_all().await?;
+            #[cfg(unix)]
+            if let Some(mode) = keep_mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await?;
+            }
+            Ok::<(), std::io::Error>(())
         };
-        if renamed.is_err() {
-            let _ = fs::remove_file(&temp).await;
+        if let Err(e) = write_temp.await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(io_fail(&tmp, e));
         }
-        renamed?;
-        Ok(data.len() as u64)
+        if let Err(e) = fs::rename(&tmp, &path).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(io_fail(&path, e));
+        }
+        let _ = keep_mode;
+
+        Ok((
+            Answer::Wrote {
+                total: data.len() as u64,
+            },
+            Vec::new(),
+        ))
     }
 
-    /// Байты по смещению поверх существующих. В отличие от записи целиком
-    /// атомарной быть не может: это правка на месте.
     async fn write_at(
         &self,
-        path: &Path,
+        cwd: Option<&str>,
+        path: &str,
         offset: u64,
         data: &[u8],
         truncate: bool,
-    ) -> Result<u64, Failure> {
-        self.check_size(path, data.len() as u64)?;
+    ) -> Outcome {
+        let path = self.resolve(cwd, path)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
+            .open(&path)
             .await
-            .map_err(|error| io_fail(path, &error))?;
-        file.seek(io::SeekFrom::Start(offset))
+            .map_err(|e| io_fail(&path, e))?;
+        file.seek(SeekFrom::Start(offset))
             .await
-            .map_err(|error| io_fail(path, &error))?;
-        file.write_all(data).await.map_err(|error| io_fail(path, &error))?;
+            .map_err(|e| io_fail(&path, e))?;
+        file.write_all(data).await.map_err(|e| io_fail(&path, e))?;
+        let end = offset + data.len() as u64;
         if truncate {
-            file.set_len(offset + data.len() as u64)
-                .await
-                .map_err(|error| io_fail(path, &error))?;
+            file.set_len(end).await.map_err(|e| io_fail(&path, e))?;
         }
-        file.flush().await.map_err(|error| io_fail(path, &error))?;
-        let meta = file.metadata().await.map_err(|error| io_fail(path, &error))?;
-        Ok(meta.len())
+        file.flush().await.map_err(|e| io_fail(&path, e))?;
+
+        let total = file.metadata().await.map(|m| m.len()).unwrap_or(end);
+        Ok((Answer::Wrote { total }, Vec::new()))
     }
 
-    /// Смещения вхождений образца и полная длина файла.
-    ///
-    /// Файл течёт мимо окном, а не ложится в память: игровые архивы бывают
-    /// на гигабайты. Окно перекрывается на длину образца без единицы —
-    /// иначе вхождение, попавшее на стык, потерялось бы. Набрав `limit`,
-    /// обрываем чтение на месте: искомое обычно лежит в начале.
     async fn find(
         &self,
-        path: &Path,
+        cwd: Option<&str>,
+        path: &str,
         pattern: &[u8],
         from: u64,
         limit: u64,
-        chunk: usize,
-    ) -> Result<(u64, Vec<u64>, bool), Failure> {
+    ) -> Outcome {
         if pattern.is_empty() {
-            return Err(Failure::invalid("nothing to search for"));
+            return Err(Failure::invalid("empty search pattern"));
         }
         if limit == 0 {
-            return Err(Failure::invalid("limit must be at least one hit"));
+            return Err(Failure::invalid("zero search limit"));
         }
         let limit = limit.min(self.limits.max_hits);
-        let meta = fs::metadata(path).await.map_err(|error| io_fail(path, &error))?;
+        let path = self.resolve(cwd, path)?;
+        let meta = fs::metadata(&path).await.map_err(|e| io_fail(&path, e))?;
         if meta.is_dir() {
-            return Err(Failure::new(
-                Code::NotAFile,
-                format!("{}: is a directory, not a file", path.display()),
-            ));
+            return Err(Failure::new(Code::NotAFile, "is a directory"));
         }
-        let total = meta.len();
-        let mut file = fs::File::open(path).await.map_err(|error| io_fail(path, &error))?;
-        file.seek(io::SeekFrom::Start(from.min(total)))
-            .await
-            .map_err(|error| io_fail(path, &error))?;
+
+        let mut file = fs::File::open(&path).await.map_err(|e| io_fail(&path, e))?;
+        if from > 0 {
+            file.seek(SeekFrom::Start(from))
+                .await
+                .map_err(|e| io_fail(&path, e))?;
+        }
 
         let finder = memchr::memmem::Finder::new(pattern);
         let overlap = pattern.len() - 1;
-        let mut window = vec![0u8; chunk + overlap];
-        // сколько байт файла уже прошло ЛЕВЕЕ начала окна
-        let mut consumed = from.min(total);
-        let mut kept = 0usize;
         let mut offsets = Vec::new();
         let mut stopped = false;
+        let mut base = from;
+        let mut window: Vec<u8> = Vec::with_capacity(CHUNK + overlap);
+
         loop {
-            let read = file
-                .read(&mut window[kept..])
+            let carry = window.len();
+            window.resize(carry + CHUNK, 0);
+            let n = file
+                .read(&mut window[carry..])
                 .await
-                .map_err(|error| io_fail(path, &error))?;
-            if read == 0 {
+                .map_err(|e| io_fail(&path, e))?;
+            window.truncate(carry + n);
+            if window.is_empty() {
                 break;
             }
-            let filled = kept + read;
-            for at in finder.find_iter(&window[..filled]) {
-                offsets.push(consumed + at as u64);
+
+            for pos in finder.find_iter(&window) {
+                offsets.push(base + pos as u64);
                 if offsets.len() as u64 >= limit {
                     stopped = true;
                     break;
                 }
             }
-            if stopped {
+            if stopped || n == 0 {
                 break;
             }
-            // хвост длиной в перекрытие переезжает в начало окна
-            kept = overlap.min(filled);
-            let tail = filled - kept;
-            window.copy_within(tail..filled, 0);
-            consumed += tail as u64;
+
+            // Keep the last `overlap` bytes so a match spanning the boundary is
+            // not lost; advance `base` past what we drop.
+            let keep = overlap.min(window.len());
+            let drop = window.len() - keep;
+            base += drop as u64;
+            window.drain(..drop);
         }
-        Ok((total, offsets, stopped))
+
+        let total = offsets.len() as u64;
+        Ok((
+            Answer::Find {
+                total,
+                offsets,
+                stopped,
+            },
+            Vec::new(),
+        ))
     }
 
-    async fn remove(&self, path: &Path, recursive: bool) -> Result<(), Failure> {
-        let meta = fs::symlink_metadata(path)
-            .await
-            .map_err(|error| io_fail(path, &error))?;
-        let removed = if meta.is_dir() {
-            if recursive { fs::remove_dir_all(path).await } else { fs::remove_dir(path).await }
+    async fn list(&self, cwd: Option<&str>, path: &str) -> Outcome {
+        let path = self.resolve(cwd, path)?;
+        let mut dir = fs::read_dir(&path).await.map_err(|e| io_fail(&path, e))?;
+        let mut entries = Vec::new();
+        let mut stopped = false;
+        while let Some(item) = dir.next_entry().await.map_err(|e| io_fail(&path, e))? {
+            if entries.len() as u64 >= self.limits.max_hits {
+                stopped = true;
+                break;
+            }
+            if let Ok(entry) = entry_at(&item.path()).await {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok((Answer::List { entries, stopped }, Vec::new()))
+    }
+
+    async fn mkdir(&self, cwd: Option<&str>, path: &str, parents: bool) -> Outcome {
+        let path = self.resolve(cwd, path)?;
+        let res = if parents {
+            fs::create_dir_all(&path).await
         } else {
-            fs::remove_file(path).await
+            fs::create_dir(&path).await
         };
-        removed.map_err(|error| io_fail(path, &error))
+        res.map_err(|e| io_fail(&path, e))?;
+        Ok((Answer::Done, Vec::new()))
     }
 
-    /// Команда через `sh -c`. Окружение неинтерактивное: терминала здесь
-    /// нет, и программа, решившая, что он есть, висит до самого таймаута.
+    async fn remove(&self, cwd: Option<&str>, path: &str, recursive: bool) -> Outcome {
+        let path = self.resolve(cwd, path)?;
+        let meta = fs::symlink_metadata(&path)
+            .await
+            .map_err(|e| io_fail(&path, e))?;
+        let res = if meta.is_dir() {
+            if recursive {
+                fs::remove_dir_all(&path).await
+            } else {
+                fs::remove_dir(&path).await
+            }
+        } else {
+            fs::remove_file(&path).await
+        };
+        res.map_err(|e| io_fail(&path, e))?;
+        Ok((Answer::Done, Vec::new()))
+    }
+
+    async fn rename(&self, cwd: Option<&str>, from: &str, to: &str) -> Outcome {
+        let from = self.resolve(cwd, from)?;
+        let to = self.resolve(cwd, to)?;
+        fs::rename(&from, &to).await.map_err(|e| io_fail(&from, e))?;
+        Ok((Answer::Done, Vec::new()))
+    }
+
     async fn exec(
         &self,
         cwd: Option<&str>,
         command: &str,
         timeout_ms: u64,
         stdin: Vec<u8>,
-    ) -> Result<(Answer, Vec<u8>), Failure> {
+    ) -> Outcome {
         if !self.limits.exec {
-            return Err(Failure::new(
-                Code::Unsupported,
-                "this machine hands out files only: running commands is switched off",
-            ));
+            return Err(Failure::new(Code::Unsupported, "exec is disabled"));
         }
         if command.trim().is_empty() {
-            return Err(Failure::invalid("command is empty"));
+            return Err(Failure::invalid("empty command"));
         }
-        let timeout = Duration::from_millis(match timeout_ms {
-            0 => self.limits.exec_timeout_secs * 1000,
-            asked => asked.min(self.limits.exec_max_timeout_secs * 1000),
-        });
-        let dir = match cwd {
-            Some(dir) => Some(self.resolve(None, dir)?),
-            None => None,
-        };
 
-        let spawn = |program: &str| {
-            let mut cmd = Command::new(program);
-            harden(&mut cmd);
-            if let Some(dir) = &dir {
-                cmd.current_dir(dir);
-            }
-            cmd.arg("-c")
-                .arg(command)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
+        let requested = if timeout_ms == 0 {
+            self.limits.exec_timeout_secs * 1000
+        } else {
+            timeout_ms
         };
-        // PATH сервисного окружения бывает без шелла, /bin/sh же есть везде
-        let mut child = match spawn("sh") {
+        let cap = self.limits.exec_max_timeout_secs * 1000;
+        let timeout = Duration::from_millis(requested.min(cap));
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(expand_home(cwd));
+        }
+        harden(&mut cmd);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => spawn("/bin/sh")
-                .map_err(|error| Failure::new(Code::Io, format!("failed to run a shell: {error}")))?,
-            Err(error) => {
-                return Err(Failure::new(Code::Io, format!("failed to run a shell: {error}")));
+            // Bare systemd units may not have `sh` on PATH.
+            Err(_) => {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(command);
+                if let Some(cwd) = cwd {
+                    cmd.current_dir(expand_home(cwd));
+                }
+                harden(&mut cmd);
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                cmd.spawn()
+                    .map_err(|e| Failure::new(Code::Io, format!("failed to spawn shell: {e}")))?
             }
         };
-        // вход кормим отдельной задачей: команда, пишущая много в вывод,
-        // иначе упёрлась бы в непрочитанную трубу, а мы — в её вход
-        let pipe = child.stdin.take();
-        tokio::spawn(async move {
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.write_all(&stdin).await;
-            }
-        });
 
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                Failure::new(
+        // Feed stdin from a separate task so a large input can't deadlock against
+        // the child filling its stdout pipe.
+        if let Some(mut sink) = child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = sink.write_all(&stdin).await;
+                let _ = sink.shutdown().await;
+            });
+        }
+
+        let wait = child.wait_with_output();
+        let output = match tokio::time::timeout(timeout, wait).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(Failure::new(Code::Io, format!("exec failed: {e}"))),
+            Err(_) => {
+                return Err(Failure::new(
                     Code::Timeout,
-                    format!("the command was still running after {:?}, so it was killed", timeout),
-                )
-            })?
-            .map_err(|error| Failure::new(Code::Io, format!("the command failed: {error}")))?;
+                    format!("command timed out after {} ms", timeout.as_millis()),
+                ));
+            }
+        };
 
+        let cap = self.limits.max_output as usize;
         Ok((
             Answer::Exec {
                 code: output.status.code(),
-                stdout: cap(&String::from_utf8_lossy(&output.stdout), self.limits.max_output),
-                stderr: cap(&String::from_utf8_lossy(&output.stderr), self.limits.max_output),
+                stdout: clamp(&output.stdout, cap),
+                stderr: clamp(&output.stderr, cap),
             },
             Vec::new(),
         ))
     }
+}
 
-    fn check_size(&self, path: &Path, size: u64) -> Result<(), Failure> {
-        if size > self.limits.max_write {
-            return Err(Failure::new(
-                Code::TooLarge,
-                format!(
-                    "{}: {size} bytes offered, this machine takes at most {} per write",
-                    path.display(),
-                    self.limits.max_write
-                ),
-            ));
-        }
-        Ok(())
+pub(crate) fn harden(cmd: &mut Command) {
+    for (k, v) in [
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("TERM", "dumb"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("DEBIAN_FRONTEND", "noninteractive"),
+        ("NO_COLOR", "1"),
+        ("CLICOLOR", "0"),
+    ] {
+        cmd.env(k, v);
     }
 }
 
-async fn write_temp(temp: &Path, data: &[u8], mode: Option<u32>) -> Result<(), Failure> {
-    let mut file = fs::File::create(temp).await.map_err(|error| io_fail(temp, &error))?;
-    file.write_all(data).await.map_err(|error| io_fail(temp, &error))?;
-    // на диск до подмены: иначе после падения машины на месте файла может
-    // оказаться его новая длина со старым содержимым
-    file.sync_all().await.map_err(|error| io_fail(temp, &error))?;
-    drop(file);
-    if let Some(mode) = mode {
-        fs::set_permissions(temp, PermissionsExt::from_mode(mode))
-            .await
-            .map_err(|error| io_fail(temp, &error))?;
+fn clamp(bytes: &[u8], cap: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= cap {
+        return text.into_owned();
     }
-    Ok(())
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
-async fn entry_at(path: &Path) -> Result<Entry, Failure> {
-    let meta = fs::symlink_metadata(path)
-        .await
-        .map_err(|error| io_fail(path, &error))?;
-    let kind = if meta.is_symlink() {
-        Kind::Symlink
-    } else if meta.is_dir() {
-        Kind::Dir
-    } else if meta.is_file() {
-        Kind::File
-    } else {
-        Kind::Other
-    };
-    let target = match kind {
-        Kind::Symlink => fs::read_link(path)
-            .await
-            .ok()
-            .map(|to| to.to_string_lossy().into_owned()),
-        _ => None,
-    };
-    // у симлинка спрашиваем длину цели: «сколько там байт» — вопрос про
-    // файл, а не про запись каталога
-    let size = match kind {
-        Kind::Symlink => fs::metadata(path).await.map(|meta| meta.len()).unwrap_or(0),
-        _ => meta.len(),
-    };
-    Ok(Entry {
-        name: path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-        kind,
-        size,
-        mode: meta.permissions().mode() & 0o7777,
-        mtime: meta
-            .modified()
-            .ok()
-            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-            .map(|since| since.as_secs() as i64),
-        target,
-    })
-}
-
-/// Ошибка файловой системы с кодом, по которому спрашивающий отличит
-/// «файла нет» от «слишком велик» — и не выдаст пустоту за содержимое.
-fn io_fail(path: &Path, error: &io::Error) -> Failure {
-    let code = match error.kind() {
-        io::ErrorKind::NotFound => Code::NotFound,
-        io::ErrorKind::PermissionDenied => Code::Denied,
-        io::ErrorKind::IsADirectory => Code::NotAFile,
-        io::ErrorKind::NotADirectory => Code::NotADir,
-        _ => Code::Io,
-    };
-    Failure::new(code, format!("{}: {error}", path.display()))
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return PathBuf::from(path);
-    };
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
-        return home;
-    }
-    match path.strip_prefix("~/") {
-        Some(rest) => home.join(rest),
-        None => PathBuf::from(path),
-    }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME") {
+            return Path::new(&home).join(rest);
+        }
+    PathBuf::from(path)
 }
 
-/// Разобрать `.` и `..` не трогая диск: путь может вести к тому, чего ещё
-/// нет, а изгородь корней всё равно должна сработать.
+/// Fold `.` and `..` lexically, without touching disk — the path may not exist
+/// yet, but the fence still has to apply.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
+    for comp in path.components() {
+        match comp {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                if !out.pop() {
+                    out.push("..");
+                }
             }
-            other => out.push(other),
+            other => out.push(other.as_os_str()),
         }
     }
     out
 }
 
-fn cap(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}\n[truncated at {max} chars]", &text[..cut]),
-        None => text.to_owned(),
+fn temp_sibling(path: &Path) -> PathBuf {
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let name = format!(
+        ".eva-hands.{pid}.{seq}.tmp.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+    );
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
     }
 }
 
-/// Терминала здесь нет: `git log` уходит в пейджер и ждёт нажатия, git
-/// просит пароль, curses мусорит escape-последовательностями в выхлоп,
-/// который потом читает модель. Дешевле сказать всем сразу, что мы не
-/// терминал.
-fn harden(cmd: &mut Command) {
-    cmd.env("PAGER", "cat")
-        .env("GIT_PAGER", "cat")
-        .env("TERM", "dumb")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .env("NO_COLOR", "1")
-        .env("CLICOLOR", "0");
+fn existing_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+async fn entry_at(path: &Path) -> Result<Entry, Failure> {
+    let meta = fs::symlink_metadata(path).await.map_err(|e| io_fail(path, e))?;
+    let file_type = meta.file_type();
+    let (kind, size, target) = if file_type.is_symlink() {
+        let target = fs::read_link(path).await.ok();
+        let size = fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+        (
+            Kind::Symlink,
+            size,
+            target.map(|t| t.to_string_lossy().into_owned()),
+        )
+    } else if file_type.is_dir() {
+        (Kind::Dir, meta.len(), None)
+    } else if file_type.is_file() {
+        (Kind::File, meta.len(), None)
+    } else {
+        (Kind::Other, meta.len(), None)
+    };
+
+    let mode = mode_of(&meta);
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64))
+        .or_else(|| {
+            meta.modified()
+                .ok()
+                .and_then(|t| UNIX_EPOCH.duration_since(t).ok().map(|d| -(d.as_secs() as i64)))
+        });
+
+    Ok(Entry {
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        kind,
+        size,
+        mode,
+        mtime,
+        target,
+    })
+}
+
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+fn io_fail(path: &Path, e: std::io::Error) -> Failure {
+    use std::io::ErrorKind::*;
+    let code = match e.kind() {
+        NotFound => Code::NotFound,
+        PermissionDenied => Code::Denied,
+        _ => match e.raw_os_error() {
+            Some(21) => Code::NotAFile, // EISDIR
+            Some(20) => Code::NotADir,  // ENOTDIR
+            _ => Code::Io,
+        },
+    };
+    Failure::new(code, format!("{}: {e}", path.display()))
+}
+
+/// The machine's hostname, for the handshake greeting.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| "unknown".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::Op;
 
-    /// Свой каталог на тест: временные файлы соседних тестов не должны
-    /// путаться под ногами.
-    struct Sandbox(PathBuf);
-
-    impl Sandbox {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("eva-hands-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-
-        fn path(&self, name: &str) -> String {
-            self.0.join(name).to_string_lossy().into_owned()
-        }
-    }
-
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn temp_dir() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("eva-hands-ops-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn ops() -> Ops {
         Ops::new(Limits::default())
     }
 
-    async fn read_all(ops: &Ops, path: &str) -> Vec<u8> {
-        ops.read(Path::new(path), 0, None).await.unwrap().1
+    async fn run(ops: &Ops, op: Op, body: Vec<u8>) -> Result<(Answer, Vec<u8>), Failure> {
+        ops.run(
+            Request {
+                id: 0,
+                cwd: None,
+                op,
+            },
+            body,
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn write_read_and_window() {
-        let dir = Sandbox::new("window");
+    async fn write_then_read_roundtrip() {
+        let dir = temp_dir();
+        let path = dir.join("file.bin").to_string_lossy().into_owned();
         let ops = ops();
-        let path = dir.path("nested/data.bin");
+        let data = vec![7u8; 5000];
 
-        // запись создаёт каталог по дороге
-        assert_eq!(ops.write(Path::new(&path), b"hello world", true, None).await.unwrap(), 11);
-        assert_eq!(read_all(&ops, &path).await, b"hello world");
+        let (answer, _) = run(
+            &ops,
+            Op::Write {
+                path: path.clone(),
+                create_dirs: false,
+                mode: None,
+            },
+            data.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(answer, Answer::Wrote { total: 5000 }));
 
-        let (total, slice) = ops.read(Path::new(&path), 6, Some(5)).await.unwrap();
-        assert_eq!((total, slice), (11, b"world".to_vec()));
-        // окно за концом файла — пусто, но длина честная
-        let (total, slice) = ops.read(Path::new(&path), 99, Some(5)).await.unwrap();
-        assert_eq!((total, slice.len()), (11, 0));
-        // просят больше, чем осталось — отдаём остаток
-        let (_, slice) = ops.read(Path::new(&path), 9, Some(500)).await.unwrap();
-        assert_eq!(slice, b"ld".to_vec());
+        let (answer, body) = run(
+            &ops,
+            Op::Read {
+                path: path.clone(),
+                offset: 1000,
+                len: Some(100),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(answer, Answer::Read { total: 5000, offset: 1000 }));
+        assert_eq!(body, vec![7u8; 100]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn write_at_patches_and_truncates() {
-        let dir = Sandbox::new("write-at");
+    async fn read_offset_past_end_is_empty() {
+        let dir = temp_dir();
+        let path = dir.join("f").to_string_lossy().into_owned();
         let ops = ops();
-        let path = dir.path("save.dat");
-        ops.write(Path::new(&path), b"HELLO world", true, None).await.unwrap();
+        run(
+            &ops,
+            Op::Write {
+                path: path.clone(),
+                create_dirs: false,
+                mode: None,
+            },
+            b"hello".to_vec(),
+        )
+        .await
+        .unwrap();
 
-        // патч по смещению не меняет длину
-        assert_eq!(ops.write_at(Path::new(&path), 0, b"salut", false).await.unwrap(), 11);
-        assert_eq!(read_all(&ops, &path).await, b"salut world");
-        // с усечением — обрубает хвост ровно после записанного
-        assert_eq!(ops.write_at(Path::new(&path), 5, b"!", true).await.unwrap(), 6);
-        assert_eq!(read_all(&ops, &path).await, b"salut!");
-        // запись за концом растягивает файл
-        assert_eq!(ops.write_at(Path::new(&path), 8, b"xx", false).await.unwrap(), 10);
+        let (answer, body) = run(
+            &ops,
+            Op::Read {
+                path,
+                offset: 100,
+                len: None,
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(answer, Answer::Read { total: 5, offset: 5 }));
+        assert!(body.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn write_keeps_the_old_file_when_it_fails() {
-        let dir = Sandbox::new("atomic");
+    async fn write_at_and_truncate() {
+        let dir = temp_dir();
+        let path = dir.join("f").to_string_lossy().into_owned();
         let ops = ops();
-        let path = dir.path("keep.txt");
-        ops.write(Path::new(&path), b"old", true, None).await.unwrap();
+        run(
+            &ops,
+            Op::Write {
+                path: path.clone(),
+                create_dirs: false,
+                mode: None,
+            },
+            b"0123456789".to_vec(),
+        )
+        .await
+        .unwrap();
 
-        // каталога нет и создавать не просили — прежний файл цел, временный
-        // не остался
-        let missing = dir.path("gone/keep.txt");
-        assert!(ops.write(Path::new(&missing), b"new", false, None).await.is_err());
-        assert_eq!(read_all(&ops, &path).await, b"old");
-        let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".eva-hands."))
-            .collect();
-        assert!(leftovers.is_empty(), "остался мусор: {leftovers:?}");
+        let (answer, _) = run(
+            &ops,
+            Op::WriteAt {
+                path: path.clone(),
+                offset: 4,
+                truncate: true,
+            },
+            b"XY".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(answer, Answer::Wrote { total: 6 }));
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123XY");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn missing_file_is_not_an_empty_one() {
+    async fn find_offsets_and_limit() {
+        let dir = temp_dir();
+        let path = dir.join("f").to_string_lossy().into_owned();
         let ops = ops();
-        let failure = ops.read(Path::new("/nonexistent/eva/nope"), 0, None).await.unwrap_err();
-        assert_eq!(failure.code, Code::NotFound);
-        assert!(failure.message.to_lowercase().contains("no such file"), "{failure}");
+        run(
+            &ops,
+            Op::Write {
+                path: path.clone(),
+                create_dirs: false,
+                mode: None,
+            },
+            b"XX__XX__XX".to_vec(),
+        )
+        .await
+        .unwrap();
 
-        let failure = ops.find(Path::new("/nonexistent/eva/nope"), b"x", 0, 8, CHUNK).await.unwrap_err();
-        assert_eq!(failure.code, Code::NotFound);
+        let (answer, _) = run(
+            &ops,
+            Op::Find {
+                path: path.clone(),
+                from: 0,
+                limit: 10,
+            },
+            b"XX".to_vec(),
+        )
+        .await
+        .unwrap();
+        match answer {
+            Answer::Find { offsets, stopped, .. } => {
+                assert_eq!(offsets, vec![0, 4, 8]);
+                assert!(!stopped);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let (answer, _) = run(
+            &ops,
+            Op::Find {
+                path,
+                from: 0,
+                limit: 2,
+            },
+            b"XX".to_vec(),
+        )
+        .await
+        .unwrap();
+        match answer {
+            Answer::Find { offsets, stopped, .. } => {
+                assert_eq!(offsets, vec![0, 4]);
+                assert!(stopped);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn find_spans_the_window_boundary() {
-        let dir = Sandbox::new("find");
+    async fn exec_echo_and_stdin() {
         let ops = ops();
-        let path = dir.path("archive.bin");
-        // образец лежит ровно на стыке окон: без перекрытия он потерялся бы
-        let mut data = vec![b'.'; 30];
-        data[14..18].copy_from_slice(b"EVA!");
-        data[24..28].copy_from_slice(b"EVA!");
-        ops.write(Path::new(&path), &data, true, None).await.unwrap();
-
-        let (total, hits, stopped) = ops.find(Path::new(&path), b"EVA!", 0, 10, 16).await.unwrap();
-        assert_eq!((total, hits, stopped), (30, vec![14, 24], false));
-
-        // поиск с середины отдаёт смещения от начала файла, а не от окна
-        let (_, hits, _) = ops.find(Path::new(&path), b"EVA!", 20, 10, 16).await.unwrap();
-        assert_eq!(hits, vec![24]);
-
-        // набрав лимит, обрываем чтение и честно говорим об этом
-        let (_, hits, stopped) = ops.find(Path::new(&path), b"EVA!", 0, 1, 16).await.unwrap();
-        assert_eq!((hits, stopped), (vec![14], true));
-
-        // пустой образец нашёлся бы всюду — это не поиск
-        assert_eq!(
-            ops.find(Path::new(&path), b"", 0, 10, 16).await.unwrap_err().code,
-            Code::Invalid
-        );
+        let (answer, _) = run(
+            &ops,
+            Op::Exec {
+                command: "cat".into(),
+                timeout_ms: 5000,
+            },
+            b"piped".to_vec(),
+        )
+        .await
+        .unwrap();
+        match answer {
+            Answer::Exec { code, stdout, .. } => {
+                assert_eq!(code, Some(0));
+                assert_eq!(stdout, "piped");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn find_survives_a_window_smaller_than_the_pattern() {
-        let dir = Sandbox::new("find-tiny");
+    async fn exec_timeout() {
         let ops = ops();
-        let path = dir.path("tiny.bin");
-        ops.write(Path::new(&path), b"..LONGPATTERN..", true, None).await.unwrap();
-        let (_, hits, _) = ops.find(Path::new(&path), b"LONGPATTERN", 0, 4, 2).await.unwrap();
-        assert_eq!(hits, vec![2]);
+        let result = run(
+            &ops,
+            Op::Exec {
+                command: "sleep 5".into(),
+                timeout_ms: 200,
+            },
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, Code::Timeout);
     }
 
     #[tokio::test]
-    async fn stat_and_list_tell_kind_and_size() {
-        let dir = Sandbox::new("stat");
-        let ops = ops();
-        ops.write(Path::new(&dir.path("a.txt")), b"abc", true, None).await.unwrap();
-        ops.write(Path::new(&dir.path("sub/b.txt")), b"defg", true, None).await.unwrap();
-
-        let entry = entry_at(Path::new(&dir.path("a.txt"))).await.unwrap();
-        assert_eq!((entry.name.as_str(), entry.kind, entry.size), ("a.txt", Kind::File, 3));
-
-        let (entries, stopped) = ops.list(&dir.0).await.unwrap();
-        assert!(!stopped);
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["a.txt", "sub"]);
-        assert_eq!(entries[1].kind, Kind::Dir);
-    }
-
-    #[tokio::test]
-    async fn remove_rename_and_mkdir() {
-        let dir = Sandbox::new("housekeeping");
-        let ops = ops();
-        let from = dir.path("one.txt");
-        let to = dir.path("two.txt");
-        ops.write(Path::new(&from), b"x", true, None).await.unwrap();
-
-        let renamed = Request {
-            id: 1,
-            cwd: None,
-            op: Op::Rename { from: from.clone(), to: to.clone() },
+    async fn roots_fence_denies_outside() {
+        let dir = temp_dir();
+        let limits = Limits {
+            roots: vec![dir.join("allowed")],
+            ..Limits::default()
         };
-        ops.run(renamed, Vec::new()).await.unwrap();
-        assert_eq!(read_all(&ops, &to).await, b"x");
+        let ops = Ops::new(limits);
 
-        let made = Request {
-            id: 2,
-            cwd: Some(dir.0.to_string_lossy().into_owned()),
-            op: Op::Mkdir { path: "made/deeper".into(), parents: true },
-        };
-        ops.run(made, Vec::new()).await.unwrap();
-        assert_eq!(entry_at(&dir.0.join("made/deeper")).await.unwrap().kind, Kind::Dir);
-        ops.remove(Path::new(&to), false).await.unwrap();
-        assert_eq!(ops.read(Path::new(&to), 0, None).await.unwrap_err().code, Code::NotFound);
-
-        // непустой каталог без recursive не сносится, с ним — сносится
-        ops.write(Path::new(&dir.path("tree/deep/f")), b"y", true, None).await.unwrap();
-        assert!(ops.remove(Path::new(&dir.path("tree")), false).await.is_err());
-        ops.remove(Path::new(&dir.path("tree")), true).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn roots_fence_and_dots_do_not_climb_out() {
-        let dir = Sandbox::new("roots");
-        let ops = Ops::new(Limits { roots: vec![dir.0.clone()], ..Limits::default() });
-
-        let inside = ops.resolve(None, &dir.path("ok.txt")).unwrap();
-        assert!(inside.starts_with(&dir.0));
-        // выбраться через .. нельзя: путь разбирается до проверки
-        let out = ops.resolve(None, &dir.path("../../etc/passwd")).unwrap_err();
-        assert_eq!(out.code, Code::Denied);
-        assert_eq!(ops.resolve(None, "/etc/passwd").unwrap_err().code, Code::Denied);
-        assert_eq!(ops.resolve(None, "  ").unwrap_err().code, Code::Invalid);
-    }
-
-    #[tokio::test]
-    async fn relative_paths_lean_on_the_working_directory() {
-        let dir = Sandbox::new("cwd");
-        let ops = ops();
-        let at = ops.resolve(Some(&dir.0.to_string_lossy()), "sub/file.txt").unwrap();
-        assert_eq!(at, dir.0.join("sub/file.txt"));
-    }
-
-    #[tokio::test]
-    async fn read_cap_says_the_size_instead_of_handing_out_a_gigabyte() {
-        let dir = Sandbox::new("cap");
-        let ops = Ops::new(Limits { max_read: 4, ..Limits::default() });
-        let path = dir.path("big.bin");
-        Ops::new(Limits::default())
-            .write(Path::new(&path), b"0123456789", true, None)
-            .await
-            .unwrap();
-        let failure = ops.read(Path::new(&path), 0, None).await.unwrap_err();
-        assert_eq!(failure.code, Code::TooLarge);
-        assert!(failure.message.contains("10 bytes"), "{failure}");
-    }
-
-    #[tokio::test]
-    async fn exec_runs_reports_and_can_be_switched_off() {
-        let ops = ops();
-        let (answer, _) = ops
-            .run(
-                Request {
-                    id: 1,
-                    cwd: None,
-                    op: Op::Exec { command: "cat; echo done".into(), timeout_ms: 10_000 },
-                },
-                b"fed in".to_vec(),
-            )
-            .await
-            .unwrap();
-        let Answer::Exec { code, stdout, .. } = answer else { panic!("exec") };
-        assert_eq!(code, Some(0));
-        assert_eq!(stdout, "fed indone\n");
-
-        let (answer, _) = ops
-            .run(
-                Request { id: 2, cwd: None, op: Op::Exec { command: "exit 3".into(), timeout_ms: 10_000 } },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        let Answer::Exec { code, .. } = answer else { panic!("exec") };
-        assert_eq!(code, Some(3));
-
-        let quiet = Ops::new(Limits { exec: false, ..Limits::default() });
-        let failure = quiet
-            .run(
-                Request { id: 3, cwd: None, op: Op::Exec { command: "true".into(), timeout_ms: 0 } },
-                Vec::new(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(failure.code, Code::Unsupported);
-    }
-
-    #[tokio::test]
-    async fn exec_timeout_is_an_error_not_an_empty_answer() {
-        let ops = ops();
-        let failure = ops
-            .run(
-                Request { id: 1, cwd: None, op: Op::Exec { command: "sleep 5".into(), timeout_ms: 150 } },
-                Vec::new(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(failure.code, Code::Timeout);
+        let outside = dir.join("elsewhere/f").to_string_lossy().into_owned();
+        let result = run(
+            &ops,
+            Op::Write {
+                path: outside,
+                create_dirs: true,
+                mode: None,
+            },
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, Code::Denied);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

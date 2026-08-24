@@ -1,136 +1,212 @@
-//! Руки целиком: демон слушает настоящий порт, клиент приходит по сети со
-//! своим ключом. Модульные тесты говорят по трубе в памяти и не увидели бы
-//! ни аутентификации, ни проверки ключа машины.
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use std::{sync::Arc, time::Duration};
+use eva_hands::{Hands, Limits, Ops, Psk, copy, server, transport};
+use tokio::net::TcpListener;
 
-use eva_hands::{Endpoint, Hands, Limits, ops::Ops, transport};
-
-struct Machine {
-    address: String,
-    /// Публичный ключ машины — его пинует клиент.
-    host_key: String,
-    dir: std::path::PathBuf,
-}
-
-impl Drop for Machine {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Поднять демон на свободном порту, пустив в него ровно эти ключи.
-async fn machine(name: &str, allowed: &[String]) -> Machine {
-    let dir = std::env::temp_dir().join(format!("eva-hands-net-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn temp_dir() -> std::path::PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("eva-hands-net-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
-    let host = transport::host_key(&dir.join("host_key")).unwrap();
-    let host_key = host.public_key().to_openssh().unwrap();
-    let access = Arc::new(transport::Access::parse(&allowed.join("\n")).unwrap());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
+/// Run a daemon on an ephemeral port. Returns its address.
+async fn daemon(psk: &Psk) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let key = psk.derive32();
     let ops = Arc::new(Ops::new(Limits::default()));
     tokio::spawn(async move {
-        let _ = transport::listen(listener, host, access, ops).await;
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ops = ops.clone();
+            tokio::spawn(async move {
+                if let Ok(stream) = transport::responder_handshake(tcp, &key).await {
+                    let _ = server::serve(stream, ops).await;
+                }
+            });
+        }
     });
-    Machine { address, host_key, dir }
-}
-
-/// Завести ключ на диске и вернуть путь и его публичную половину.
-fn key(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, String) {
-    let path = dir.join(name);
-    let key = transport::host_key(&path).unwrap();
-    (path, key.public_key().to_openssh().unwrap())
+    addr
 }
 
 #[tokio::test]
-async fn the_key_is_the_whole_permission() {
-    let keys = std::env::temp_dir().join(format!("eva-hands-keys-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&keys);
-    std::fs::create_dir_all(&keys).unwrap();
-    let (mine, my_public) = key(&keys, "mine");
-    let (stranger, _) = key(&keys, "stranger");
+async fn local_mode_full_cycle() {
+    let dir = temp_dir();
+    let path = dir.join("f.bin").to_string_lossy().into_owned();
+    let hands = Hands::local(Limits::default());
 
-    let machine = machine("auth", &[my_public]).await;
+    let data = vec![42u8; 4096];
+    hands.write(None, &path, &data, false, None).await.unwrap();
+    let (total, got) = hands.read(None, &path, 0, None).await.unwrap();
+    assert_eq!(total, 4096);
+    assert_eq!(got, data);
 
-    // свой ключ: руки открываются и работают
-    let hands = Hands::remote(Endpoint {
-        address: machine.address.clone(),
-        user: "eva".into(),
-        key: mine,
-        host_key: Some(machine.host_key.clone()),
-    });
-    let greeting = hands.greeting().await.expect("рукопожатие");
+    let out = hands
+        .exec(None, "printf hi", 5000, Vec::new())
+        .await
+        .unwrap();
+    assert!(out.ok());
+    assert_eq!(out.stdout, "hi");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn encrypted_roundtrip_and_greeting() {
+    let psk = Psk::new("correct horse battery staple, but high entropy please");
+    let addr = daemon(&psk).await;
+    let dir = temp_dir();
+    let path = dir.join("blob").to_string_lossy().into_owned();
+
+    let hands = Hands::remote(addr, &psk);
+    let greeting = hands.greeting().await.unwrap();
     assert_eq!(greeting.protocol, eva_hands::proto::PROTOCOL);
 
-    let path = machine.dir.join("file.bin").to_string_lossy().into_owned();
-    hands.write(None, &path, b"\x00\x01binary'quoted\n".to_vec(), true).await.unwrap();
-    let (total, bytes) = hands.read(None, &path, 0, None).await.unwrap();
-    assert_eq!((total as usize, bytes.as_slice()), (16, b"\x00\x01binary'quoted\n".as_slice()));
+    // Binary content survives the channel intact.
+    let data: Vec<u8> = (0..=255u8).cycle().take(9000).collect();
+    let wrote = hands.write(None, &path, &data, false, None).await.unwrap();
+    assert_eq!(wrote, 9000);
+    let (total, got) = hands.read(None, &path, 0, None).await.unwrap();
+    assert_eq!(total, 9000);
+    assert_eq!(got, data);
 
-    // чужой ключ: до операций дело не доходит
-    let outsider = Hands::remote(Endpoint {
-        address: machine.address.clone(),
-        user: "eva".into(),
-        key: stranger,
-        host_key: Some(machine.host_key.clone()),
-    });
-    let error = outsider.stat(None, &path).await.unwrap_err();
-    assert!(error.is_unavailable(), "{error}");
-    assert!(error.to_string().contains("did not accept the key"), "{error}");
-
-    let _ = std::fs::remove_dir_all(&keys);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
-async fn a_machine_with_the_wrong_host_key_is_refused() {
-    let keys = std::env::temp_dir().join(format!("eva-hands-hostpin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&keys);
-    std::fs::create_dir_all(&keys).unwrap();
-    let (mine, my_public) = key(&keys, "mine");
-    let (_, someone_else) = key(&keys, "other");
+async fn wrong_key_cannot_connect() {
+    let psk = Psk::new("the-real-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let addr = daemon(&psk).await;
 
-    let machine = machine("hostpin", &[my_public]).await;
-    // адрес тот, ключ машины — чужой: так выглядит подмена
-    let hands = Hands::remote(Endpoint {
-        address: machine.address.clone(),
-        user: "eva".into(),
-        key: mine,
-        host_key: Some(someone_else),
-    });
-    let error = hands.ping().await.unwrap_err();
-    assert!(error.is_unavailable(), "{error}");
-
-    let _ = std::fs::remove_dir_all(&keys);
+    let hands = Hands::remote(addr, &Psk::new("a-different-key-bbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    let err = hands.ping(None).await.unwrap_err();
+    assert!(err.is_unavailable(), "expected Unavailable, got {err:?}");
 }
 
 #[tokio::test]
-async fn the_connection_carries_everything_at_once() {
-    let keys = std::env::temp_dir().join(format!("eva-hands-mux-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&keys);
-    std::fs::create_dir_all(&keys).unwrap();
-    let (mine, my_public) = key(&keys, "mine");
-    let machine = machine("mux", &[my_public]).await;
+async fn copy_local_to_remote_and_back() {
+    let psk = Psk::new("transfer-key-high-entropy-xxxxxxxxxxxxxxxx");
+    let addr = daemon(&psk).await;
+    let remote = Hands::remote(addr, &psk);
+    let local = Hands::local(Limits::default());
 
-    let hands = Arc::new(Hands::remote(Endpoint {
-        address: machine.address.clone(),
-        user: "eva".into(),
-        key: mine,
-        host_key: Some(machine.host_key.clone()),
-    }));
+    let dir = temp_dir();
+    let src = dir.join("src").to_string_lossy().into_owned();
+    let on_remote = dir.join("remote_copy").to_string_lossy().into_owned();
+    let back = dir.join("back").to_string_lossy().into_owned();
+
+    // A file larger than one copy window (1 MiB) to exercise chunking.
+    let data: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
+    local.write(None, &src, &data, false, None).await.unwrap();
+
+    let n = copy(&local, None, &src, &remote, None, &on_remote).await.unwrap();
+    assert_eq!(n, data.len() as u64);
+
+    let n = copy(&remote, None, &on_remote, &local, None, &back).await.unwrap();
+    assert_eq!(n, data.len() as u64);
+
+    assert_eq!(std::fs::read(&back).unwrap(), data);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn session_local_stream_input_and_kill() {
+    let hands = Hands::local(Limits::default());
+    // Echoes each stdin line back, staying alive between lines.
+    let sid = hands
+        .exec_start(None, "while read line; do echo \"got:$line\"; done", Vec::new())
+        .await
+        .unwrap();
+    hands.exec_input(sid, b"hello\n".to_vec()).await.unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        let (out, _err, alive, _code) = hands.exec_poll(sid, 300).await.unwrap();
+        seen.extend_from_slice(&out);
+        if String::from_utf8_lossy(&seen).contains("got:hello") {
+            break;
+        }
+        assert!(alive, "process died before echoing");
+    }
+    assert!(String::from_utf8_lossy(&seen).contains("got:hello"), "{seen:?}");
+
+    hands.exec_kill(sid).await.unwrap();
+    let mut died = false;
+    for _ in 0..40 {
+        let (_o, _e, alive, _c) = hands.exec_poll(sid, 300).await.unwrap();
+        if !alive {
+            died = true;
+            break;
+        }
+    }
+    assert!(died, "session did not die after kill");
+}
+
+#[tokio::test]
+async fn session_reports_exit_code() {
+    let hands = Hands::local(Limits::default());
+    let sid = hands
+        .exec_start(None, "printf out; exit 3", Vec::new())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut code = None;
+    for _ in 0..40 {
+        let (o, _e, alive, c) = hands.exec_poll(sid, 300).await.unwrap();
+        out.extend_from_slice(&o);
+        if !alive {
+            code = c;
+            break;
+        }
+    }
+    assert_eq!(code, Some(3));
+    assert!(String::from_utf8_lossy(&out).contains("out"));
+}
+
+#[tokio::test]
+async fn session_over_encrypted_channel() {
+    let psk = Psk::new("session-key-high-entropy-zzzzzzzzzzzzzzzz");
+    let addr = daemon(&psk).await;
+    let hands = Hands::remote(addr, &psk);
+
+    let sid = hands
+        .exec_start(None, "printf hello; exit 0", Vec::new())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut code = None;
+    for _ in 0..40 {
+        let (o, _e, alive, c) = hands.exec_poll(sid, 300).await.unwrap();
+        out.extend_from_slice(&o);
+        if !alive {
+            code = c;
+            break;
+        }
+    }
+    assert_eq!(code, Some(0));
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
+}
+
+#[tokio::test]
+async fn multiplex_slow_exec_does_not_block_ping() {
+    let psk = Psk::new("multiplex-key-high-entropy-yyyyyyyyyyyyyyyy");
+    let addr = daemon(&psk).await;
+    let hands = Arc::new(Hands::remote(addr, &psk));
+
     let slow = {
         let hands = hands.clone();
-        tokio::spawn(async move {
-            hands.exec(None, "sleep 1; echo late", Duration::from_secs(10), Vec::new()).await
-        })
+        tokio::spawn(async move { hands.exec(None, "sleep 1", 5000, Vec::new()).await })
     };
-    // одно соединение, а долгая команда не запирает файловые операции
-    hands.ping().await.unwrap();
-    let dir = machine.dir.to_string_lossy().into_owned();
-    assert!(!hands.list(None, &dir).await.unwrap().0.is_empty());
-    assert_eq!(slow.await.unwrap().unwrap().stdout.trim(), "late");
 
-    let _ = std::fs::remove_dir_all(&keys);
+    // The ping must come back well before the slow exec finishes.
+    let pinged = tokio::time::timeout(Duration::from_millis(400), hands.ping(None)).await;
+    assert!(pinged.is_ok(), "ping was blocked by the slow exec");
+    pinged.unwrap().unwrap();
+
+    let out = slow.await.unwrap().unwrap();
+    assert!(out.ok());
 }

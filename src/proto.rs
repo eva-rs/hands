@@ -1,38 +1,29 @@
-//! Проволочный формат: кадр, запрос, ответ, коды ошибок.
+//! The wire protocol.
 //!
-//! Кадр — две длины, JSON-шапка и сырое тело. Содержимое файлов едет телом,
-//! мимо JSON: base64 раздувает вчетверо и заставляет обе стороны держать в
-//! памяти ещё одну копию, а гигабайтные архивы и без того на пределе.
+//! A frame is two big-endian lengths, a JSON header, then a raw body:
 //!
-//! Шапка несёт `id`, и ответы приходят в любом порядке: по одному
-//! соединению идут все операции разом, и долгая команда не должна запирать
-//! чтение файла. Рабочий каталог — поле запроса, а не состояние сессии:
-//! состояние на общем соединении — это гонка между чатами, у каждого из
-//! которых свой каталог.
+//! ```text
+//! u32 header_len | u32 body_len | header (JSON) | body (raw bytes)
+//! ```
+//!
+//! File contents ride in the body, outside the JSON, so they are not base64
+//! inflated. Every request carries an `id`; replies may come back in any order,
+//! because a single connection multiplexes everything — a slow `exec` must not
+//! block a file read. The working directory is a per-request field, not session
+//! state.
 
-use std::io;
-
-use serde::{Deserialize, Serialize};
+use eva::data;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Версия протокола: клиент старше или младше демона — честный отказ на
-/// рукопожатии, а не разъезжающиеся поля в середине разговора.
-pub const PROTOCOL: u32 = 1;
+use crate::limits::Limits;
 
-/// Потолок JSON-шапки. Шапка — это метаданные операции; мегабайт хватает и
-/// самому длинному пути, а всё, что больше, — мусор или чужой протокол.
+/// Wire version. A mismatch is caught at the handshake ([`Answer::Hello`]).
+pub const PROTOCOL: u32 = 2;
+
+/// Ceiling on the JSON header, independent of body limits.
 pub const MAX_HEADER: usize = 1024 * 1024;
 
-/// Кадр целиком: шапка и тело.
-#[derive(Debug)]
-pub struct Frame {
-    pub header: Vec<u8>,
-    pub body: Vec<u8>,
-}
-
-/// Запрос. `cwd` — от чего считать относительные пути и где исполнять
-/// команду; без него относительный путь считается от каталога демона.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[data]
 pub struct Request {
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,18 +31,16 @@ pub struct Request {
     pub op: Op,
 }
 
-/// Операция. Тело кадра несёт данные записи, образец поиска или stdin
-/// команды — что именно, видно по операции.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[data]
+#[serde(tag = "kind")]
 pub enum Op {
-    /// Живо ли соединение. Простаивающая ssh-труба умеет умирать молча.
     Ping,
-    /// Метаданные пути: тип, размер, права, время правки.
-    Stat { path: String },
-    /// Содержимое каталога.
-    List { path: String },
-    /// Кусок файла: `len` не задан — до конца, в пределах потолка чтения.
+    Stat {
+        path: String,
+    },
+    List {
+        path: String,
+    },
     Read {
         path: String,
         #[serde(default)]
@@ -59,7 +48,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         len: Option<u64>,
     },
-    /// Файл целиком (тело кадра). Пишется атомарно.
+    /// Whole-file, atomic. Body holds the contents.
     Write {
         path: String,
         #[serde(default)]
@@ -67,15 +56,14 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
     },
-    /// Байты (тело кадра) поверх существующих; `truncate` обрубает хвост.
+    /// In-place write at an offset. Body holds the bytes.
     WriteAt {
         path: String,
         offset: u64,
         #[serde(default)]
         truncate: bool,
     },
-    /// Смещения вхождений образца (тело кадра). Файл читается потоком на
-    /// той стороне — по проводу едут только находки.
+    /// Streaming byte search. Body holds the pattern; the reply lists offsets.
     Find {
         path: String,
         #[serde(default)]
@@ -92,78 +80,125 @@ pub enum Op {
         #[serde(default)]
         recursive: bool,
     },
-    Rename { from: String, to: String },
-    /// Команда через `sh -c` с таймаутом; тело кадра уезжает ей на вход.
-    Exec { command: String, timeout_ms: u64 },
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Run a command through `sh -c`. Body holds stdin.
+    Exec {
+        command: String,
+        timeout_ms: u64,
+    },
+    /// Start a background session (`sh -c`) that outlives the request. Body holds
+    /// initial stdin. Reply is [`Answer::Started`].
+    ExecStart {
+        command: String,
+    },
+    /// Long-poll a session: returns as soon as there is new output, the process
+    /// exits, or `max_wait_ms` elapses. Reply is [`Answer::Chunk`], whose body is
+    /// `u32 stdout_len (BE) | stdout | stderr`.
+    ExecPoll {
+        session: u64,
+        max_wait_ms: u64,
+    },
+    /// Feed bytes (body) to a session's stdin.
+    ExecInput {
+        session: u64,
+    },
+    /// Terminate a session and its process tree.
+    ExecKill {
+        session: u64,
+    },
 }
 
-/// Ответ на запрос с тем же `id`. Рукопожатие приходит с `id` = 0 само,
-/// без запроса.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Op {
+    /// Read-only ops are safe to retry after a dropped connection; mutating ops
+    /// are not (an interrupted channel must never rewrite a file twice).
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Op::Ping | Op::Stat { .. } | Op::List { .. } | Op::Read { .. } | Op::Find { .. }
+        )
+    }
+}
+
+#[data]
 pub struct Response {
     pub id: u64,
     #[serde(flatten)]
     pub result: Reply,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[data]
 pub enum Reply {
     Ok(Answer),
     Err(Failure),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[data]
+#[serde(tag = "kind")]
 pub enum Answer {
-    /// Первый кадр соединения: с кем и о чём мы говорим.
+    /// Sent unsolicited with `id = 0` as the first frame of every connection.
     Hello {
         protocol: u32,
         version: String,
         host: String,
-        limits: crate::limits::Limits,
+        limits: Limits,
     },
     Pong,
-    /// Операция без ответных данных: mkdir, remove, rename.
     Done,
-    Stat { entry: Entry },
-    List { entries: Vec<Entry>, stopped: bool },
-    /// Байты — телом кадра; `total` — вся длина файла, чтобы спрашивающий
-    /// видел, где он в файле и сколько осталось.
-    Read { total: u64, offset: u64 },
-    Wrote { total: u64 },
-    /// `stopped` — упёрлись в `limit`, а не дочитали файл.
+    Stat {
+        entry: Entry,
+    },
+    List {
+        entries: Vec<Entry>,
+        stopped: bool,
+    },
+    /// Bytes ride in the body; `total` is the file's full length.
+    Read {
+        total: u64,
+        offset: u64,
+    },
+    Wrote {
+        total: u64,
+    },
     Find {
         total: u64,
         offsets: Vec<u64>,
         stopped: bool,
     },
-    /// `code` пуст, если команду убил сигнал.
     Exec {
         code: Option<i32>,
         stdout: String,
         stderr: String,
     },
+    /// A session was started.
+    Started {
+        session: u64,
+    },
+    /// One poll's worth of a session's output; bytes ride in the body as
+    /// `u32 stdout_len (BE) | stdout | stderr`. `alive` is false once the process
+    /// has exited, and then `code` is its exit code (`None` if killed by signal).
+    Chunk {
+        alive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+    },
 }
 
-/// Запись каталога или сам путь у `stat`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[data]
 pub struct Entry {
     pub name: String,
     pub kind: Kind,
     pub size: u64,
-    /// Права в юниксовом смысле, младшие 12 бит.
     pub mode: u32,
-    /// Время правки, unix-секунды; None — файловая система не сказала.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime: Option<i64>,
-    /// Куда указывает симлинк.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[data(copy)]
 pub enum Kind {
     File,
     Dir,
@@ -171,34 +206,31 @@ pub enum Kind {
     Other,
 }
 
-/// Отказ операции. Код нужен, чтобы спрашивающий отличал «файла нет» от
-/// «слишком велик» и не выдавал пустоту за содержимое.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[data(error, display("{code:?}: {message}"))]
 pub struct Failure {
     pub code: Code,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[data(copy)]
 pub enum Code {
     NotFound,
     NotAFile,
     NotADir,
-    /// Путь вне разрешённых корней или прав не хватило.
     Denied,
     TooLarge,
     Timeout,
-    /// Запрос бессмысленный: пустой путь, пустой образец, нулевой лимит.
     Invalid,
-    /// Операция выключена настройкой машины.
     Unsupported,
     Io,
 }
 
 impl Failure {
     pub fn new(code: Code, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -206,64 +238,60 @@ impl Failure {
     }
 }
 
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
+pub struct Frame {
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
 }
 
-impl std::error::Error for Failure {}
+fn broken(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_owned())
+}
 
-/// Записать кадр целиком одной порцией: соседний кадр из другой задачи не
-/// должен вклиниться между шапкой и телом.
+/// Write one frame with a single `write_all`, so a concurrent task's frame
+/// cannot interleave between the header and the body.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     header: &[u8],
     body: &[u8],
-) -> io::Result<()> {
-    let mut frame = Vec::with_capacity(8 + header.len() + body.len());
-    frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(header);
-    frame.extend_from_slice(body);
-    writer.write_all(&frame).await?;
+) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(8 + header.len() + body.len());
+    buf.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(body);
+    writer.write_all(&buf).await?;
     writer.flush().await
 }
 
-/// Прочитать кадр. `None` — собеседник закрылся на границе кадра (это не
-/// ошибка); оборванный на середине кадр — ошибка, иначе обрезанная запись
-/// выглядела бы как удачная.
+/// Read one frame. `Ok(None)` is a clean end of the conversation (EOF exactly on
+/// a frame boundary); EOF partway through a frame is an error. Enforces
+/// [`MAX_HEADER`] and `max_body` before allocating.
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
-    max_body: u64,
-) -> io::Result<Option<Frame>> {
-    let mut lengths = [0u8; 8];
-    // первый байт отдельно: только на нём EOF означает «разговор окончен»
-    match reader.read_exact(&mut lengths[..1]).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    max_body: usize,
+) -> std::io::Result<Option<Frame>> {
+    let mut first = [0u8; 1];
+    if reader.read(&mut first).await? == 0 {
+        return Ok(None);
     }
-    reader.read_exact(&mut lengths[1..]).await?;
+    let mut rest = [0u8; 7];
+    reader.read_exact(&mut rest).await?;
 
-    let header_len = u32::from_be_bytes(lengths[..4].try_into().unwrap()) as usize;
-    let body_len = u64::from(u32::from_be_bytes(lengths[4..].try_into().unwrap()));
+    let header_len = u32::from_be_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
+    let body_len = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]) as usize;
+
     if header_len > MAX_HEADER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame header of {header_len} bytes exceeds the {MAX_HEADER} byte limit"),
-        ));
+        return Err(broken("header too large"));
     }
     if body_len > max_body {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame body of {body_len} bytes exceeds the {max_body} byte limit"),
-        ));
+        return Err(broken("body too large"));
     }
+
     let mut header = vec![0u8; header_len];
     reader.read_exact(&mut header).await?;
-    let mut body = vec![0u8; body_len as usize];
+    let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).await?;
+
     Ok(Some(Frame { header, body }))
 }
 
@@ -271,75 +299,55 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
-    fn header(value: &impl Serialize) -> Vec<u8> {
-        serde_json::to_vec(value).unwrap()
-    }
-
-    #[tokio::test]
-    async fn frame_round_trip_keeps_header_and_body_apart() {
-        let request = Request {
-            id: 7,
-            cwd: Some("/srv/games".into()),
-            op: Op::Write { path: "a.bin".into(), create_dirs: true, mode: None },
-        };
-        let mut wire = Vec::new();
-        write_frame(&mut wire, &header(&request), b"\x00\xffbytes").await.unwrap();
-
-        let frame = read_frame(&mut wire.as_slice(), 1024).await.unwrap().unwrap();
-        let back: Request = serde_json::from_slice(&frame.header).unwrap();
-        assert_eq!(back.id, 7);
-        assert_eq!(back.cwd.as_deref(), Some("/srv/games"));
-        // тело не тронуто: ни base64, ни экранирования
-        assert_eq!(frame.body, b"\x00\xffbytes");
-    }
-
-    #[tokio::test]
-    async fn clean_eof_ends_the_conversation_but_a_cut_frame_is_an_error() {
-        let empty: &[u8] = &[];
-        assert!(read_frame(&mut { empty }, 1024).await.unwrap().is_none());
-
-        let mut wire = Vec::new();
-        write_frame(&mut wire, b"{}", b"body").await.unwrap();
-        wire.truncate(wire.len() - 2);
-        let error = read_frame(&mut wire.as_slice(), 1024).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-    }
-
-    #[tokio::test]
-    async fn oversized_body_is_refused_before_it_is_read() {
-        let mut wire = Vec::new();
-        write_frame(&mut wire, b"{}", &vec![0u8; 4096]).await.unwrap();
-        let error = read_frame(&mut wire.as_slice(), 64).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("4096"), "{error}");
-    }
-
     #[test]
-    fn wire_shape_is_stable() {
+    fn read_answer_wire_shape() {
         let response = Response {
             id: 3,
-            result: Reply::Ok(Answer::Read { total: 900, offset: 16 }),
+            result: Reply::Ok(Answer::Read {
+                total: 900,
+                offset: 16,
+            }),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"id":3,"ok":{"kind":"read","total":900,"offset":16}}"#);
-
-        let failed = Response {
-            id: 4,
-            result: Reply::Err(Failure::new(Code::NotFound, "gone")),
-        };
-        let json = serde_json::to_string(&failed).unwrap();
-        assert_eq!(json, r#"{"id":4,"err":{"code":"not_found","message":"gone"}}"#);
-        // и обратно: разбор своего же ответа не должен зависеть от порядка
-        let back: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back.result, Reply::Err(f) if f.code == Code::NotFound));
     }
 
     #[test]
-    fn request_defaults_keep_short_headers_readable() {
-        let request: Request =
-            serde_json::from_str(r#"{"id":1,"op":{"kind":"read","path":"/etc/hosts"}}"#).unwrap();
-        assert!(request.cwd.is_none());
-        let Op::Read { offset, len, .. } = request.op else { panic!("read") };
-        assert_eq!((offset, len), (0, None));
+    fn failure_wire_shape() {
+        let response = Response {
+            id: 4,
+            result: Reply::Err(Failure::new(Code::NotFound, "gone")),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"id":4,"err":{"code":"not_found","message":"gone"}}"#);
+    }
+
+    #[test]
+    fn request_round_trips() {
+        let request = Request {
+            id: 7,
+            cwd: Some("/tmp".into()),
+            op: Op::Write {
+                path: "a.txt".into(),
+                create_dirs: true,
+                mode: None,
+            },
+        };
+        let json = serde_json::to_vec(&request).unwrap();
+        let back: Request = serde_json::from_slice(&json).unwrap();
+        assert_eq!(request, back);
+    }
+
+    #[tokio::test]
+    async fn frame_round_trips() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let header = br#"{"id":1}"#.to_vec();
+        let body = vec![0u8, 1, 2, 3, 255];
+        write_frame(&mut a, &header, &body).await.unwrap();
+        drop(a);
+        let frame = read_frame(&mut b, 1024).await.unwrap().unwrap();
+        assert_eq!(frame.header, header);
+        assert_eq!(frame.body, body);
+        assert!(read_frame(&mut b, 1024).await.unwrap().is_none());
     }
 }

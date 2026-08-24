@@ -1,375 +1,266 @@
-//! Транспорт: свой ssh — и сервер, и клиент. Ssh-демона на машине не нужно,
-//! ssh-бинаря у клиента тоже: руки слушают собственный порт и пускают только
-//! того, кто владеет приватным ключом из своего `authorized_keys`.
+//! The encrypted channel.
 //!
-//! Криптография не наша: рукопожатие, обмен ключами, шифр и проверка
-//! подписи — реализация протокола SSH (`russh`). Своего здесь ровно две
-//! вещи: кого пускать и что течёт внутри канала — наши кадры.
+//! Noise `NNpsk0` over TCP via `snow`: both sides send an ephemeral key (so the
+//! session has forward secrecy), and the pre-shared key is mixed in at the very
+//! start of the handshake. Without the matching PSK the first message fails to
+//! authenticate, so a connection cannot be established — there is no
+//! unencrypted, unauthenticated path in.
+//!
+//! [`EncryptedStream`] wraps the TCP stream as a plain encrypted byte pipe
+//! (`AsyncRead + AsyncWrite`); the protocol frames ride on top of it unchanged.
+//! Under the hood each Noise message is length-prefixed (`u16`) and carries at
+//! most `MAX_PAYLOAD` plaintext bytes.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 
-use russh::{
-    Channel, ChannelOpenFailure, ChannelStream, MethodKind, MethodSet, client,
-    keys::{
-        Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, load_secret_key, ssh_key,
-    },
-    server::{self, Auth, Msg, Server as _, Session},
-};
-use tokio::{
-    io::{ReadHalf, WriteHalf},
-    net::TcpListener,
-};
+use snow::{Builder, HandshakeState, TransportState};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpStream, ToSocketAddrs};
 
-use crate::{client::Error, ops::Ops};
+const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
-/// Как часто спрашиваем «жив ли ты» на простаивающем соединении. Ядро
-/// держит его часами, а выброшенное NAT-ом соединение иначе обнаружится
-/// только операцией.
-const KEEPALIVE: Duration = Duration::from_secs(30);
+/// A Noise message is at most 65535 bytes; 16 of those are the AEAD tag.
+const MAX_NOISE_MSG: usize = 65535;
+const MAX_PAYLOAD: usize = MAX_NOISE_MSG - 16;
 
-/// Сколько неотвеченных keepalive терпим, прежде чем считать соединение
-/// мёртвым.
-const KEEPALIVE_MAX: usize = 3;
-
-/// Пауза перед отказом в аутентификации — чтобы по времени ответа нельзя
-/// было отличить неизвестный ключ от известного.
-const REJECTION_DELAY: Duration = Duration::from_secs(2);
-
-// --- сторона машины ---------------------------------------------------
-
-/// Кому руки открываются. Формат тот же, что у `authorized_keys`: одна
-/// строка — один публичный ключ.
-pub struct Access {
-    allowed: Vec<PublicKey>,
+fn noise_io(e: snow::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("noise: {e}"))
 }
 
-impl Access {
-    /// Разобрать `authorized_keys`. Строки с опциями (`command="…"`,
-    /// `from="…"`) не поддерживаются: это возможности ssh-демона, которого
-    /// здесь нет, — что позволено рукам, говорит их собственная настройка.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let mut allowed = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+fn builder(psk: &[u8; 32]) -> io::Result<Builder<'_>> {
+    let params = PARAMS
+        .parse()
+        .map_err(|e| io::Error::other(format!("bad noise params: {e}")))?;
+    Builder::new(params).psk(0, psk).map_err(noise_io)
+}
+
+async fn write_handshake<S: AsyncWrite + Unpin>(
+    inner: &mut S,
+    hs: &mut HandshakeState,
+    scratch: &mut [u8],
+) -> io::Result<()> {
+    let n = hs.write_message(&[], scratch).map_err(noise_io)?;
+    inner.write_all(&(n as u16).to_be_bytes()).await?;
+    inner.write_all(&scratch[..n]).await?;
+    inner.flush().await
+}
+
+async fn read_handshake<S: AsyncRead + Unpin>(
+    inner: &mut S,
+    hs: &mut HandshakeState,
+) -> io::Result<()> {
+    let mut len = [0u8; 2];
+    inner.read_exact(&mut len).await?;
+    let n = u16::from_be_bytes(len) as usize;
+    let mut msg = vec![0u8; n];
+    inner.read_exact(&mut msg).await?;
+    let mut out = vec![0u8; n];
+    hs.read_message(&msg, &mut out).map_err(noise_io)?;
+    Ok(())
+}
+
+/// Responder side of the handshake (the daemon). `NNpsk0` is `-> e` then
+/// `<- e, ee`, so the responder reads first.
+pub async fn responder_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    mut inner: S,
+    psk: &[u8; 32],
+) -> io::Result<EncryptedStream<S>> {
+    let mut hs = builder(psk)?.build_responder().map_err(noise_io)?;
+    let mut scratch = vec![0u8; MAX_NOISE_MSG];
+    read_handshake(&mut inner, &mut hs).await?;
+    write_handshake(&mut inner, &mut hs, &mut scratch).await?;
+    let transport = hs.into_transport_mode().map_err(noise_io)?;
+    Ok(EncryptedStream::new(inner, transport))
+}
+
+/// Initiator side of the handshake (the client).
+pub async fn initiator_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    mut inner: S,
+    psk: &[u8; 32],
+) -> io::Result<EncryptedStream<S>> {
+    let mut hs = builder(psk)?.build_initiator().map_err(noise_io)?;
+    let mut scratch = vec![0u8; MAX_NOISE_MSG];
+    write_handshake(&mut inner, &mut hs, &mut scratch).await?;
+    read_handshake(&mut inner, &mut hs).await?;
+    let transport = hs.into_transport_mode().map_err(noise_io)?;
+    Ok(EncryptedStream::new(inner, transport))
+}
+
+/// Connect to a daemon and complete the handshake. A wrong key surfaces here as
+/// an error.
+pub async fn connect<A: ToSocketAddrs>(
+    addr: A,
+    psk: &[u8; 32],
+) -> io::Result<EncryptedStream<TcpStream>> {
+    let tcp = TcpStream::connect(addr).await?;
+    tcp.set_nodelay(true).ok();
+    initiator_handshake(tcp, psk).await
+}
+
+/// An encrypted byte stream over an inner transport.
+pub struct EncryptedStream<S> {
+    inner: S,
+    noise: TransportState,
+
+    // Reading: a 2-byte length, then that many ciphertext bytes, then decrypt.
+    rx_len: [u8; 2],
+    rx_len_got: usize,
+    rx_body: Vec<u8>,
+    rx_body_need: usize,
+    rx_body_got: usize,
+    rx_plain: Vec<u8>,
+    rx_plain_pos: usize,
+
+    // Writing: buffer plaintext until flush, then seal and drain to the inner.
+    tx_plain: Vec<u8>,
+    tx_enc: Vec<u8>,
+    tx_enc_pos: usize,
+}
+
+impl<S> EncryptedStream<S> {
+    fn new(inner: S, noise: TransportState) -> Self {
+        Self {
+            inner,
+            noise,
+            rx_len: [0u8; 2],
+            rx_len_got: 0,
+            rx_body: Vec::new(),
+            rx_body_need: 0,
+            rx_body_got: 0,
+            rx_plain: Vec::new(),
+            rx_plain_pos: 0,
+            tx_plain: Vec::new(),
+            tx_enc: Vec::new(),
+            tx_enc_pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> EncryptedStream<S> {
+    /// Seal any buffered plaintext and drive the encrypted bytes to the inner
+    /// stream. Returns `Ready(Ok(()))` only once everything sealed so far is
+    /// written.
+    fn drive_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.tx_enc_pos == self.tx_enc.len() && !self.tx_plain.is_empty() {
+            self.tx_enc.clear();
+            self.tx_enc_pos = 0;
+            for chunk in self.tx_plain.chunks(MAX_PAYLOAD) {
+                let mut out = vec![0u8; chunk.len() + 16];
+                let n = self
+                    .noise
+                    .write_message(chunk, &mut out)
+                    .map_err(noise_io)?;
+                self.tx_enc.extend_from_slice(&(n as u16).to_be_bytes());
+                self.tx_enc.extend_from_slice(&out[..n]);
             }
-            match PublicKey::from_openssh(line) {
-                Ok(key) => allowed.push(key),
-                Err(error) => log::warn!("skipping an unreadable authorized key: {error}"),
+            self.tx_plain.clear();
+        }
+
+        while self.tx_enc_pos < self.tx_enc.len() {
+            let n = ready!(
+                Pin::new(&mut self.inner).poll_write(cx, &self.tx_enc[self.tx_enc_pos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
+            self.tx_enc_pos += n;
         }
-        if allowed.is_empty() {
-            return Err("no usable public keys: the hands would let nobody in".to_owned());
-        }
-        Ok(Self { allowed })
-    }
-
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        Self::parse(&text).map_err(|why| format!("{}: {why}", path.display()))
-    }
-
-    /// Ключ сравнивается по самому ключу: комментарий в конце строки —
-    /// подпись для человека, а не часть удостоверения.
-    pub fn allows(&self, key: &PublicKey) -> bool {
-        self.allowed.iter().any(|known| known.key_data() == key.key_data())
-    }
-
-    pub fn len(&self) -> usize {
-        self.allowed.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.allowed.is_empty()
+        self.tx_enc.clear();
+        self.tx_enc_pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
-/// Ключ самой машины: им она представляется, и по нему клиент узнаёт, что
-/// пришёл туда же, куда в прошлый раз. Файла нет — заводим и кладём рядом.
-pub fn host_key(path: &Path) -> Result<PrivateKey, String> {
-    match load_secret_key(path, None) {
-        Ok(key) => Ok(key),
-        Err(_) if !path.exists() => {
-            let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-                .map_err(|error| format!("could not make a host key: {error}"))?;
-            write_host_key(path, &key)?;
-            log::info!("made a host key at {}", path.display());
-            Ok(key)
-        }
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
-}
-
-fn write_host_key(path: &Path, key: &PrivateKey) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    }
-    let text = key
-        .to_openssh(ssh_key::LineEnding::LF)
-        .map_err(|error| format!("could not write the host key: {error}"))?;
-    // 0600 при создании, а не после: между созданием и chmod ключ был бы
-    // читаем кем угодно
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    std::io::Write::write_all(&mut file, text.as_bytes())
-        .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// Отпечаток ключа — им машина называется в логах и в настройке клиента.
-pub fn fingerprint(key: &PublicKey) -> String {
-    key.fingerprint(HashAlg::Sha256).to_string()
-}
-
-/// Слушать до конца света. Соединения обслуживаются параллельно, каждое
-/// своими кадрами.
-pub async fn listen(
-    listener: TcpListener,
-    host: PrivateKey,
-    access: Arc<Access>,
-    ops: Arc<Ops>,
-) -> std::io::Result<()> {
-    let config = Arc::new(server::Config {
-        keys: vec![host],
-        // пароля и прочего у нас нет вовсе, и обещать их клиенту незачем
-        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
-        auth_rejection_time: REJECTION_DELAY,
-        auth_rejection_time_initial: Some(Duration::ZERO),
-        // соединение живёт часами и подолгу молчит: обрывать его по тишине
-        // нельзя, а вот спрашивать «жив ли» — нужно
-        inactivity_timeout: None,
-        keepalive_interval: Some(KEEPALIVE),
-        keepalive_max: KEEPALIVE_MAX,
-        ..Default::default()
-    });
-    let mut gate = Gate { access, ops };
-    gate.run_on_socket(config, &listener).await
-}
-
-#[derive(Clone)]
-struct Gate {
-    access: Arc<Access>,
-    ops: Arc<Ops>,
-}
-
-impl server::Server for Gate {
-    type Handler = Self;
-
-    fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> Self {
-        self.clone()
-    }
-
-    fn handle_session_error(&mut self, error: <Self::Handler as server::Handler>::Error) {
-        log::info!("session ended: {error}");
-    }
-}
-
-impl server::Handler for Gate {
-    type Error = russh::Error;
-
-    /// Проба ключа до подписи: неизвестному отвечаем сразу, не заставляя
-    /// его подписывать то, что всё равно не примут.
-    async fn auth_publickey_offered(
-        &mut self,
-        _user: &str,
-        key: &PublicKey,
-    ) -> Result<Auth, Self::Error> {
-        Ok(if self.access.allows(key) { Auth::Accept } else { Auth::reject() })
-    }
-
-    /// Подпись проверена — владение ключом доказано. Имя пользователя
-    /// значения не имеет: удостоверение здесь одно, и это ключ.
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        if self.access.allows(key) {
-            log::info!("{user} came in with {}", fingerprint(key));
-            return Ok(Auth::Accept);
-        }
-        log::warn!("refused {user} with an unknown key {}", fingerprint(key));
-        Ok(Auth::reject())
-    }
-
-    /// Канал открыт — внутри него сразу начинается наш разговор.
-    async fn channel_open_session(
-        &mut self,
-        channel: Channel<Msg>,
-        reply: server::ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply.accept().await;
-        let ops = self.ops.clone();
-        tokio::spawn(async move {
-            let (reader, writer) = tokio::io::split(channel.into_stream());
-            if let Err(error) = crate::server::serve(reader, writer, ops).await {
-                log::info!("conversation ended: {error}");
+impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        loop {
+            if me.rx_plain_pos < me.rx_plain.len() {
+                let n = buf.remaining().min(me.rx_plain.len() - me.rx_plain_pos);
+                buf.put_slice(&me.rx_plain[me.rx_plain_pos..me.rx_plain_pos + n]);
+                me.rx_plain_pos += n;
+                return Poll::Ready(Ok(()));
             }
-        });
-        Ok(())
-    }
 
-    /// Всё остальное, чем богат ssh, — проброс портов, псевдотерминал,
-    /// запуск команд самим ssh — нам не нужно и не открывается.
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        _channel: Channel<Msg>,
-        _host: &str,
-        _port: u32,
-        _originator: &str,
-        _originator_port: u32,
-        reply: server::ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-}
-
-// --- сторона ядра -----------------------------------------------------
-
-/// Куда идти за руками.
-#[derive(Debug, Clone)]
-pub struct Endpoint {
-    /// `host:port` демона.
-    pub address: String,
-    /// Имя пользователя протокола; удостоверение — ключ, не оно.
-    pub user: String,
-    /// Приватный ключ, которым представляемся.
-    pub key: PathBuf,
-    /// Ожидаемый публичный ключ машины (строка `ssh-ed25519 AAAA…`).
-    /// Не задан — принимаем любой и говорим об этом в лог: тогда чужой,
-    /// вставший на этот адрес, увидит содержимое файлов.
-    pub host_key: Option<String>,
-}
-
-/// Открытый канал к рукам.
-pub struct Link {
-    pub(crate) reader: ReadHalf<ChannelStream<client::Msg>>,
-    pub(crate) writer: WriteHalf<ChannelStream<client::Msg>>,
-    /// Пока ручка сессии жива — живо соединение.
-    pub(crate) session: client::Handle<Verifier>,
-}
-
-/// Соединиться и открыть канал. Всё, что здесь не удалось, — это
-/// недоступность рук: спрашивающий вправе пойти другим путём.
-pub async fn connect(endpoint: &Endpoint) -> Result<Link, Error> {
-    let key = load_secret_key(&endpoint.key, None)
-        .map_err(|error| Error::Unavailable(format!("{}: {error}", endpoint.key.display())))?;
-    let expected = match &endpoint.host_key {
-        Some(text) => Some(PublicKey::from_openssh(text.trim()).map_err(|error| {
-            Error::Unavailable(format!("the pinned host key does not parse: {error}"))
-        })?),
-        None => None,
-    };
-    let config = Arc::new(client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(KEEPALIVE),
-        keepalive_max: KEEPALIVE_MAX,
-        ..Default::default()
-    });
-
-    let mut session = client::connect(config, &*endpoint.address, Verifier { expected })
-        .await
-        .map_err(|error| Error::Unavailable(format!("{}: {error}", endpoint.address)))?;
-    let hash: Option<HashAlg> = session
-        .best_supported_rsa_hash()
-        .await
-        .map_err(|error| Error::Unavailable(format!("{}: {error}", endpoint.address)))?
-        .flatten();
-    let accepted = session
-        .authenticate_publickey(&endpoint.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-        .await
-        .map_err(|error| Error::Unavailable(format!("{}: {error}", endpoint.address)))?;
-    if !accepted.success() {
-        return Err(Error::Unavailable(format!(
-            "{}: the machine did not accept the key — is it in its authorized_keys?",
-            endpoint.address
-        )));
-    }
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|error| Error::Unavailable(format!("{}: {error}", endpoint.address)))?;
-    let (reader, writer) = tokio::io::split(channel.into_stream());
-    Ok(Link { reader, writer, session })
-}
-
-/// Проверка ключа машины на той стороне.
-pub struct Verifier {
-    expected: Option<PublicKey>,
-}
-
-impl client::Handler for Verifier {
-    type Error = russh::Error;
-
-    async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
-        match &self.expected {
-            Some(pinned) => Ok(pinned.key_data() == key.key_data()),
-            None => {
-                log::warn!(
-                    "the machine's host key is not pinned; it introduced itself as {} — \
-                     put that into the config to keep a stranger from taking its place",
-                    fingerprint(key)
-                );
-                Ok(true)
+            if me.rx_body_need == 0 {
+                // Reading the 2-byte length prefix.
+                while me.rx_len_got < 2 {
+                    let mut tmp = ReadBuf::new(&mut me.rx_len[me.rx_len_got..2]);
+                    ready!(Pin::new(&mut me.inner).poll_read(cx, &mut tmp))?;
+                    let filled = tmp.filled().len();
+                    if filled == 0 {
+                        return if me.rx_len_got == 0 {
+                            Poll::Ready(Ok(())) // clean EOF on a message boundary
+                        } else {
+                            Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()))
+                        };
+                    }
+                    me.rx_len_got += filled;
+                }
+                let need = u16::from_be_bytes(me.rx_len) as usize;
+                me.rx_len_got = 0;
+                if need == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty noise message",
+                    )));
+                }
+                me.rx_body_need = need;
+                me.rx_body = vec![0u8; need];
+                me.rx_body_got = 0;
             }
+
+            // Reading the ciphertext body.
+            while me.rx_body_got < me.rx_body_need {
+                let mut tmp = ReadBuf::new(&mut me.rx_body[me.rx_body_got..me.rx_body_need]);
+                ready!(Pin::new(&mut me.inner).poll_read(cx, &mut tmp))?;
+                let filled = tmp.filled().len();
+                if filled == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+                me.rx_body_got += filled;
+            }
+
+            let mut plain = vec![0u8; me.rx_body_need];
+            let n = me
+                .noise
+                .read_message(&me.rx_body, &mut plain)
+                .map_err(noise_io)?;
+            plain.truncate(n);
+            me.rx_plain = plain;
+            me.rx_plain_pos = 0;
+            me.rx_body_need = 0;
+            me.rx_body_got = 0;
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn some_key() -> PrivateKey {
-        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
+impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        me.tx_plain.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
-    #[test]
-    fn access_reads_authorized_keys_and_ignores_the_comment() {
-        let key = some_key();
-        let line = key.public_key().to_openssh().unwrap();
-        let access = Access::parse(&format!(
-            "# руки Господина\n\n{line} nero@laptop\n"
-        ))
-        .unwrap();
-        assert_eq!(access.len(), 1);
-        // тот же ключ с другой подписью — тот же ключ
-        assert!(access.allows(key.public_key()));
-        assert!(!access.allows(some_key().public_key()));
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        ready!(me.drive_write(cx))?;
+        Pin::new(&mut me.inner).poll_flush(cx)
     }
 
-    #[test]
-    fn access_without_a_single_key_refuses_to_exist() {
-        // пустой список пустил бы всех или никого — и то и другое молча
-        assert!(Access::parse("# только комментарий\n").is_err());
-        assert!(Access::parse("ssh-ed25519 not-a-key").is_err());
-    }
-
-    #[test]
-    fn a_host_key_is_made_once_and_then_reused() {
-        let dir = std::env::temp_dir().join(format!("eva-hands-hostkey-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("host_key");
-
-        let made = host_key(&path).unwrap();
-        let again = host_key(&path).unwrap();
-        assert_eq!(made.public_key().key_data(), again.public_key().key_data());
-
-        // ключ машины не должен быть читаем никем, кроме неё
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "ключ хоста лежит с правами {mode:o}");
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        ready!(me.drive_write(cx))?;
+        Pin::new(&mut me.inner).poll_shutdown(cx)
     }
 }

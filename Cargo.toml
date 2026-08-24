@@ -2,10 +2,9 @@
 name = "eva-hands"
 version = "0.1.0"
 edition = "2024"
-description = "Eva's hands on a working machine: file operations and commands over a framed protocol, authenticated by SSH keys"
+description = "Eva's hands: file and process operations, in-process or over an encrypted channel"
 
 [lib]
-name = "eva_hands"
 path = "src/lib.rs"
 
 [[bin]]
@@ -15,32 +14,39 @@ required-features = ["bin"]
 
 [features]
 default = ["bin"]
-# Всё, что нужно только исполняемому файлу: разбор аргументов, конфига и логи.
-# Ядро подключает библиотеку без этого — clap и env_logger ему не нужны.
-bin = ["dep:clap", "dep:env_logger", "dep:toml"]
+bin = ["dep:clap", "dep:base64", "eva/cli", "eva/tokio"]
 
 [dependencies]
+eva = { git = "https://git.desu.church/VienDesu/eva.git", rev = "90e3f510714c250e704ffd09441b396c0391d6a1" }
+eyre = "0.6"
+
 tokio = { version = "1", features = [
-  "fs",
-  "io-std",
-  "io-util",
-  "macros",
-  "net",
-  "process",
-  "rt-multi-thread",
-  "sync",
-  "time",
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
 ] }
+
+snow = "0.10"
+secrecy = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# Same pin as eva, so the JsonSchema trait unifies with `#[eva::data]` consumers.
+schemars = { version = "=1.0.0-alpha.17", default-features = false, features = ["std"] }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memchr = "2"
-log = "0.4"
-# транспорт и аутентификация — готовая реализация протокола SSH: своей
-# криптографии здесь нет и быть не должно
-russh = { version = "0.62.4", default-features = false, features = ["ring"] }
-# ровно та версия, что у ключей russh: генерация ключа хоста берёт её ГПСЧ
-rand = "0.10"
+log = { version = "0.4", features = ["kv"] }
 
 clap = { version = "4", features = ["derive"], optional = true }
-env_logger = { version = "0.11", optional = true }
-toml = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
