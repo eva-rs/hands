@@ -17,6 +17,8 @@ pub struct Limits {
     pub exec: bool,
     pub exec_timeout_secs: u64,
     pub exec_max_timeout_secs: u64,
+    /// Whether `fetch` may reach the network at all.
+    pub fetch: bool,
     /// Paths the hands may reach. Empty means the whole filesystem.
     pub roots: Vec<PathBuf>,
 }
@@ -31,6 +33,7 @@ impl Default for Limits {
             exec: true,
             exec_timeout_secs: 60,
             exec_max_timeout_secs: 3600,
+            fetch: true,
             roots: Vec::new(),
         }
     }

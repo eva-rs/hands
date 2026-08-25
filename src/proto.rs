@@ -20,6 +20,9 @@ use crate::limits::Limits;
 /// Wire version. A mismatch is caught at the handshake ([`Answer::Hello`]).
 pub const PROTOCOL: u32 = 2;
 
+/// Deadline a `fetch` falls back to when the request leaves `timeout_ms` at 0.
+pub const FETCH_TIMEOUT_MS: u64 = 300_000;
+
 /// Ceiling on the JSON header, independent of body limits.
 pub const MAX_HEADER: usize = 1024 * 1024;
 
@@ -62,6 +65,24 @@ pub enum Op {
         offset: u64,
         #[serde(default)]
         truncate: bool,
+    },
+    /// Download a URL straight to disk, streaming — the bytes never cross the
+    /// wire. A `path` ending in `/` is a directory: the leaf name comes from
+    /// `Content-Disposition`, else from the URL tail, and the reply says where
+    /// the file landed.
+    Fetch {
+        url: String,
+        path: String,
+        /// Proxy (`socks5://`/`http://`) — the caller sets the policy; the hands
+        /// have no network policy of their own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy: Option<String>,
+        /// Body ceiling; 0 — `limits.max_write`.
+        #[serde(default)]
+        max_bytes: u64,
+        /// Whole-request deadline; 0 — [`FETCH_TIMEOUT_MS`].
+        #[serde(default)]
+        timeout_ms: u64,
     },
     /// Streaming byte search. Body holds the pattern; the reply lists offsets.
     Find {
@@ -161,6 +182,16 @@ pub enum Answer {
     },
     Wrote {
         total: u64,
+    },
+    /// A download landed on disk. `path` is where it actually went (the caller
+    /// may have named only the directory); `final_url` is after redirects, and
+    /// `media_type` comes from `Content-Type`.
+    Fetched {
+        total: u64,
+        path: String,
+        final_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
     },
     Find {
         total: u64,

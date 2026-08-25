@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use eva_hands::client::FetchRequest;
 use eva_hands::{Hands, Limits, Ops, Psk, copy, server, transport};
 use tokio::net::TcpListener;
 
@@ -209,4 +210,51 @@ async fn multiplex_slow_exec_does_not_block_ping() {
 
     let out = slow.await.unwrap().unwrap();
     assert!(out.ok());
+}
+
+/// A download crosses no wire: only the request and the verdict do, so the
+/// file appears on the machine even though the channel never carried it.
+#[tokio::test]
+async fn fetch_over_the_channel() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await;
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\
+                  Content-Type: text/plain\r\n\r\nfetched",
+            )
+            .await;
+        let _ = stream.shutdown().await;
+    });
+
+    let psk = Psk::new("correct horse battery staple, but high entropy please");
+    let addr = daemon(&psk).await;
+    let dir = temp_dir();
+    let hands = Hands::remote(addr, &psk);
+
+    let fetched = hands
+        .fetch(
+            None,
+            FetchRequest {
+                url: format!("http://{origin}/note.txt"),
+                path: format!("{}/", dir.to_string_lossy()),
+                proxy: None,
+                max_bytes: 0,
+                timeout_ms: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fetched.total, 7);
+    assert_eq!(fetched.media_type.as_deref(), Some("text/plain"));
+    assert_eq!(fetched.path, dir.join("note.txt").to_string_lossy());
+    assert_eq!(std::fs::read(&fetched.path).unwrap(), b"fetched");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

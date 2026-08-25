@@ -86,6 +86,27 @@ impl Output {
     }
 }
 
+/// What to download and where to put it. A `path` ending in `/` is a
+/// directory: the machine picks the leaf name and reports it back.
+#[derive(Clone, Debug)]
+pub struct FetchRequest {
+    pub url: String,
+    pub path: String,
+    pub proxy: Option<String>,
+    /// Body ceiling; 0 — the machine's `max_write`.
+    pub max_bytes: u64,
+    /// Whole-request deadline; 0 — [`proto::FETCH_TIMEOUT_MS`].
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Fetched {
+    pub total: u64,
+    pub path: String,
+    pub final_url: String,
+    pub media_type: Option<String>,
+}
+
 pub struct Hands {
     backend: Backend,
 }
@@ -271,6 +292,44 @@ impl Hands {
             .await?;
         match answer {
             Answer::Wrote { total } => Ok(total),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Download a URL onto the machine, streaming — the bytes never cross this
+    /// wire, so size is bounded by the machine's `max_write`, not the frame.
+    pub async fn fetch(&self, cwd: Option<&str>, req: FetchRequest) -> Result<Fetched, Error> {
+        let timeout_ms = match req.timeout_ms {
+            0 => proto::FETCH_TIMEOUT_MS,
+            ms => ms,
+        };
+        let wait = Duration::from_millis(timeout_ms) + EXEC_MARGIN;
+        let (answer, _) = self
+            .call(
+                cwd,
+                Op::Fetch {
+                    url: req.url,
+                    path: req.path,
+                    proxy: req.proxy,
+                    max_bytes: req.max_bytes,
+                    timeout_ms: req.timeout_ms,
+                },
+                Vec::new(),
+                wait,
+            )
+            .await?;
+        match answer {
+            Answer::Fetched {
+                total,
+                path,
+                final_url,
+                media_type,
+            } => Ok(Fetched {
+                total,
+                path,
+                final_url,
+                media_type,
+            }),
             other => Err(unexpected(&other)),
         }
     }

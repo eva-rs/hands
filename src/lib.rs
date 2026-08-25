@@ -15,7 +15,7 @@ pub mod server;
 pub mod session;
 pub mod transport;
 
-pub use client::{Error, Greeting, Hands, Output, copy};
+pub use client::{Error, FetchRequest, Fetched, Greeting, Hands, Output, copy};
 pub use limits::Limits;
 pub use ops::Ops;
 pub use proto::{Answer, Code, Entry, Failure, Kind, Op};

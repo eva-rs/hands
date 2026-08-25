@@ -64,6 +64,16 @@ impl Ops {
                 offset,
                 truncate,
             } => self.write_at(cwd, &path, offset, &body, truncate).await,
+            Op::Fetch {
+                url,
+                path,
+                proxy,
+                max_bytes,
+                timeout_ms,
+            } => {
+                self.fetch(cwd, &url, &path, proxy.as_deref(), max_bytes, timeout_ms)
+                    .await
+            }
             Op::Find { path, from, limit } => self.find(cwd, &path, &body, from, limit).await,
             Op::Mkdir { path, parents } => self.mkdir(cwd, &path, parents).await,
             Op::Remove { path, recursive } => self.remove(cwd, &path, recursive).await,
@@ -225,6 +235,119 @@ impl Ops {
         Ok((
             Answer::Wrote {
                 total: data.len() as u64,
+            },
+            Vec::new(),
+        ))
+    }
+
+    async fn fetch(
+        &self,
+        cwd: Option<&str>,
+        url: &str,
+        path: &str,
+        proxy: Option<&str>,
+        max_bytes: u64,
+        timeout_ms: u64,
+    ) -> Outcome {
+        if !self.limits.fetch {
+            return Err(Failure::new(Code::Unsupported, "fetch is disabled"));
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(Failure::invalid(format!("{url} is not an http(s) url")));
+        }
+        // The trailing slash is the only thing that says "directory", and
+        // normalisation eats it — read it off the request, not off the path.
+        let into_dir = path.ends_with('/');
+        let target = self.resolve(cwd, path)?;
+
+        let cap = match max_bytes {
+            0 => self.limits.max_write,
+            n => n.min(self.limits.max_write),
+        };
+        let timeout = Duration::from_millis(match timeout_ms {
+            0 => crate::proto::FETCH_TIMEOUT_MS,
+            ms => ms,
+        });
+
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+        if let Some(proxy) = proxy {
+            let proxy = reqwest::Proxy::all(proxy)
+                .map_err(|e| Failure::invalid(format!("bad proxy: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| Failure::new(Code::Io, format!("http client: {e}")))?;
+
+        let mut response = client.get(url).send().await.map_err(fetch_fail)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Failure::new(
+                status_fail(status),
+                format!("{url} answered {status}"),
+            ));
+        }
+        if let Some(len) = response.content_length()
+            && len > cap {
+                return Err(Failure::new(
+                    Code::TooLarge,
+                    format!("body of {len} bytes exceeds {cap}"),
+                ));
+            }
+
+        let media_type = header(&response, reqwest::header::CONTENT_TYPE)
+            .map(|value| value.split(';').next().unwrap_or_default().trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let final_url = response.url().to_string();
+        let path = if into_dir {
+            let name = header(&response, reqwest::header::CONTENT_DISPOSITION)
+                .and_then(disposition_name)
+                .unwrap_or_else(|| url_leaf(response.url()));
+            target.join(leaf_name(&name))
+        } else {
+            target
+        };
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| io_fail(parent, e))?;
+        }
+        let tmp = temp_sibling(&path);
+        let stream = async {
+            let mut file = fs::File::create(&tmp).await.map_err(|e| io_fail(&tmp, e))?;
+            let mut total = 0u64;
+            while let Some(chunk) = response.chunk().await.map_err(fetch_fail)? {
+                total += chunk.len() as u64;
+                if total > cap {
+                    return Err(Failure::new(
+                        Code::TooLarge,
+                        format!("body exceeds {cap} bytes"),
+                    ));
+                }
+                file.write_all(&chunk).await.map_err(|e| io_fail(&tmp, e))?;
+            }
+            file.sync_all().await.map_err(|e| io_fail(&tmp, e))?;
+            Ok(total)
+        };
+        let total = match stream.await {
+            Ok(total) => total,
+            Err(failure) => {
+                let _ = fs::remove_file(&tmp).await;
+                return Err(failure);
+            }
+        };
+        if let Err(e) = fs::rename(&tmp, &path).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(io_fail(&path, e));
+        }
+
+        Ok((
+            Answer::Fetched {
+                total,
+                path: path.to_string_lossy().into_owned(),
+                final_url,
+                media_type,
             },
             Vec::new(),
         ))
@@ -488,6 +611,99 @@ pub(crate) fn harden(cmd: &mut Command) {
     ] {
         cmd.env(k, v);
     }
+}
+
+fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<&str> {
+    response.headers().get(name)?.to_str().ok()
+}
+
+fn fetch_fail(error: reqwest::Error) -> Failure {
+    let code = if error.is_timeout() {
+        Code::Timeout
+    } else {
+        Code::Io
+    };
+    Failure::new(code, format!("fetch failed: {error}"))
+}
+
+/// An HTTP status the caller can act on: the same distinctions the filesystem
+/// codes already make, so a tool sees "gone" and "not allowed" as themselves.
+fn status_fail(status: reqwest::StatusCode) -> Code {
+    match status.as_u16() {
+        401 | 403 => Code::Denied,
+        404 | 410 => Code::NotFound,
+        408 | 504 => Code::Timeout,
+        413 => Code::TooLarge,
+        _ => Code::Io,
+    }
+}
+
+/// `filename*=UTF-8''name` wins over `filename="name"` — the former carries the
+/// encoding, the latter is latin-1 at best.
+fn disposition_name(value: &str) -> Option<String> {
+    let mut plain = None;
+    for part in value.split(';').map(str::trim) {
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            let encoded = rest.rsplit('\'').next().unwrap_or(rest);
+            return Some(percent_decode(encoded));
+        }
+        if let Some(rest) = part.strip_prefix("filename=") {
+            plain = Some(rest.trim_matches('"').to_owned());
+        }
+    }
+    plain
+}
+
+fn url_leaf(url: &reqwest::Url) -> String {
+    let leaf = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+    percent_decode(leaf)
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
+/// A file name that cannot climb out of the directory it is joined onto.
+fn leaf_name(name: &str) -> String {
+    let leaf = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('.');
+    if leaf.is_empty() {
+        return "download".to_owned();
+    }
+    leaf.to_owned()
 }
 
 fn clamp(bytes: &[u8], cap: usize) -> String {
@@ -883,6 +1099,139 @@ mod tests {
             b"x".to_vec(),
         )
         .await;
+        assert_eq!(result.unwrap_err().code, Code::Denied);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-shot HTTP server: answers the first request and hangs up.
+    /// `headers` are appended verbatim, each ending in CRLF — leaving out
+    /// `Content-Length` is what makes the body end at EOF, and that is the
+    /// shape that exercises the streaming ceiling.
+    async fn http_once(status: &str, headers: &str, body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = format!("HTTP/1.1 {status}\r\nConnection: close\r\n{headers}\r\n");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn fetch(url: String, path: String, max_bytes: u64) -> Op {
+        Op::Fetch {
+            url,
+            path,
+            proxy: None,
+            max_bytes,
+            timeout_ms: 10_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_streams_a_body_to_disk() {
+        let dir = temp_dir();
+        let path = dir.join("book.pdf").to_string_lossy().into_owned();
+        let base = http_once(
+            "200 OK",
+            "Content-Length: 5\r\nContent-Type: application/pdf; charset=binary\r\n",
+            b"%PDF!".to_vec(),
+        )
+        .await;
+
+        let (answer, _) = run(&ops(), fetch(format!("{base}/x.pdf"), path.clone(), 0), Vec::new())
+            .await
+            .unwrap();
+        match answer {
+            Answer::Fetched {
+                total,
+                path: landed,
+                media_type,
+                ..
+            } => {
+                assert_eq!(total, 5);
+                assert_eq!(landed, path);
+                assert_eq!(media_type.as_deref(), Some("application/pdf"));
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF!");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_into_a_directory_takes_the_offered_name() {
+        let dir = temp_dir();
+        let into = format!("{}/", dir.join("downloads").to_string_lossy());
+        let base = http_once(
+            "200 OK",
+            "Content-Length: 2\r\nContent-Disposition: attachment; filename=\"ahmetov.pdf\"\r\n",
+            b"hi".to_vec(),
+        )
+        .await;
+
+        let (answer, _) = run(&ops(), fetch(format!("{base}/raw?id=7"), into, 0), Vec::new())
+            .await
+            .unwrap();
+        let Answer::Fetched { path, .. } = answer else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        assert_eq!(path, dir.join("downloads/ahmetov.pdf").to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_can_be_switched_off() {
+        let ops = Ops::new(Limits {
+            fetch: false,
+            ..Limits::default()
+        });
+        let result = run(
+            &ops,
+            fetch("http://127.0.0.1:1/x".into(), "/tmp/x".into(), 0),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, Code::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn fetch_stops_at_the_ceiling_and_leaves_no_temp() {
+        let dir = temp_dir();
+        let path = dir.join("big.bin").to_string_lossy().into_owned();
+        let base = http_once("200 OK", "", vec![7u8; 4096]).await;
+
+        let result = run(&ops(), fetch(format!("{base}/big.bin"), path, 100), Vec::new()).await;
+        assert_eq!(result.unwrap_err().code, Code::TooLarge);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_a_missing_url_as_missing() {
+        let dir = temp_dir();
+        let path = dir.join("gone.bin").to_string_lossy().into_owned();
+        let base = http_once("404 Not Found", "Content-Length: 0\r\n", Vec::new()).await;
+
+        let result = run(&ops(), fetch(format!("{base}/gone.bin"), path, 0), Vec::new()).await;
+        assert_eq!(result.unwrap_err().code, Code::NotFound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_obeys_the_roots_fence() {
+        let dir = temp_dir();
+        let ops = Ops::new(Limits {
+            roots: vec![dir.join("allowed")],
+            ..Limits::default()
+        });
+        let outside = dir.join("elsewhere/f").to_string_lossy().into_owned();
+
+        let result = run(&ops, fetch("http://127.0.0.1:1/x".into(), outside, 0), Vec::new()).await;
         assert_eq!(result.unwrap_err().code, Code::Denied);
         std::fs::remove_dir_all(&dir).ok();
     }
