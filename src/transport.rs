@@ -159,9 +159,8 @@ impl<S: AsyncWrite + Unpin> EncryptedStream<S> {
         }
 
         while self.tx_enc_pos < self.tx_enc.len() {
-            let n = ready!(
-                Pin::new(&mut self.inner).poll_write(cx, &self.tx_enc[self.tx_enc_pos..])
-            )?;
+            let n =
+                ready!(Pin::new(&mut self.inner).poll_write(cx, &self.tx_enc[self.tx_enc_pos..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }

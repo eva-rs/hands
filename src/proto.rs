@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::limits::Limits;
 
 /// Wire version. A mismatch is caught at the handshake ([`Answer::Hello`]).
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// Deadline a `fetch` falls back to when the request leaves `timeout_ms` at 0.
 pub const FETCH_TIMEOUT_MS: u64 = 300_000;
@@ -200,6 +200,8 @@ pub enum Answer {
     },
     Exec {
         code: Option<i32>,
+        signal: Option<String>,
+        timed_out_ms: Option<u64>,
         stdout: String,
         stderr: String,
     },
@@ -340,7 +342,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&response).unwrap();
-        assert_eq!(json, r#"{"id":3,"ok":{"kind":"read","total":900,"offset":16}}"#);
+        assert_eq!(
+            json,
+            r#"{"id":3,"ok":{"kind":"read","total":900,"offset":16}}"#
+        );
     }
 
     #[test]
@@ -350,7 +355,10 @@ mod tests {
             result: Reply::Err(Failure::new(Code::NotFound, "gone")),
         };
         let json = serde_json::to_string(&response).unwrap();
-        assert_eq!(json, r#"{"id":4,"err":{"code":"not_found","message":"gone"}}"#);
+        assert_eq!(
+            json,
+            r#"{"id":4,"err":{"code":"not_found","message":"gone"}}"#
+        );
     }
 
     #[test]

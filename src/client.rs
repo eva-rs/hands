@@ -13,9 +13,7 @@ use tokio::time::timeout;
 
 use crate::limits::Limits;
 use crate::ops::{Ops, hostname};
-use crate::proto::{
-    self, Answer, Code, Entry, Failure, Op, PROTOCOL, Reply, Request, Response,
-};
+use crate::proto::{self, Answer, Code, Entry, Failure, Op, PROTOCOL, Reply, Request, Response};
 use crate::secret::Psk;
 use crate::transport;
 
@@ -76,13 +74,15 @@ pub struct Greeting {
 #[derive(Clone, Debug)]
 pub struct Output {
     pub code: Option<i32>,
+    pub signal: Option<String>,
+    pub timed_out_ms: Option<u64>,
     pub stdout: String,
     pub stderr: String,
 }
 
 impl Output {
     pub fn ok(&self) -> bool {
-        self.code == Some(0)
+        self.code == Some(0) && self.signal.is_none() && self.timed_out_ms.is_none()
     }
 }
 
@@ -186,7 +186,8 @@ impl Hands {
                     Err(Error::Unavailable(_)) if read_only => {
                         remote.forget().await;
                         let conn = remote.conn().await?;
-                        conn.call(cwd, &op, retry_body.unwrap_or_default(), wait).await
+                        conn.call(cwd, &op, retry_body.unwrap_or_default(), wait)
+                            .await
                     }
                     other => other,
                 }
@@ -378,7 +379,12 @@ impl Hands {
         Ok(())
     }
 
-    pub async fn remove(&self, cwd: Option<&str>, path: &str, recursive: bool) -> Result<(), Error> {
+    pub async fn remove(
+        &self,
+        cwd: Option<&str>,
+        path: &str,
+        recursive: bool,
+    ) -> Result<(), Error> {
         self.call(
             cwd,
             Op::Remove {
@@ -413,11 +419,18 @@ impl Hands {
         timeout_ms: u64,
         stdin: Vec<u8>,
     ) -> Result<Output, Error> {
-        let wait = if timeout_ms == 0 {
-            FILE_WAIT
+        let limits = self.greeting().await?.limits;
+        let requested = if timeout_ms == 0 {
+            limits.exec_timeout_secs.saturating_mul(1000)
         } else {
-            Duration::from_millis(timeout_ms) + EXEC_MARGIN
+            timeout_ms
         };
+        let effective = requested.min(limits.exec_max_timeout_secs.saturating_mul(1000));
+        // Include the server's TERM grace and pipe drain so the client does
+        // not give up just before a valid timed-out Exec answer arrives.
+        let wait = Duration::from_millis(effective)
+            .saturating_add(EXEC_MARGIN)
+            .saturating_add(Duration::from_secs(3));
         let (answer, _) = self
             .call(
                 cwd,
@@ -432,10 +445,14 @@ impl Hands {
         match answer {
             Answer::Exec {
                 code,
+                signal,
+                timed_out_ms,
                 stdout,
                 stderr,
             } => Ok(Output {
                 code,
+                signal,
+                timed_out_ms,
                 stdout,
                 stderr,
             }),
@@ -452,7 +469,14 @@ impl Hands {
         stdin: Vec<u8>,
     ) -> Result<u64, Error> {
         let (answer, _) = self
-            .call(cwd, Op::ExecStart { command: command.into() }, stdin, FILE_WAIT)
+            .call(
+                cwd,
+                Op::ExecStart {
+                    command: command.into(),
+                },
+                stdin,
+                FILE_WAIT,
+            )
             .await?;
         match answer {
             Answer::Started { session } => Ok(session),
@@ -469,7 +493,15 @@ impl Hands {
     ) -> Result<(Vec<u8>, Vec<u8>, bool, Option<i32>), Error> {
         let wait = Duration::from_millis(max_wait_ms) + EXEC_MARGIN;
         let (answer, body) = self
-            .call(None, Op::ExecPoll { session, max_wait_ms }, Vec::new(), wait)
+            .call(
+                None,
+                Op::ExecPoll {
+                    session,
+                    max_wait_ms,
+                },
+                Vec::new(),
+                wait,
+            )
             .await?;
         match answer {
             Answer::Chunk { alive, code } => {
@@ -482,13 +514,15 @@ impl Hands {
 
     /// Feed bytes to a session's stdin.
     pub async fn exec_input(&self, session: u64, data: Vec<u8>) -> Result<(), Error> {
-        self.call(None, Op::ExecInput { session }, data, FILE_WAIT).await?;
+        self.call(None, Op::ExecInput { session }, data, FILE_WAIT)
+            .await?;
         Ok(())
     }
 
     /// Terminate a session and its process tree.
     pub async fn exec_kill(&self, session: u64) -> Result<(), Error> {
-        self.call(None, Op::ExecKill { session }, Vec::new(), FILE_WAIT).await?;
+        self.call(None, Op::ExecKill { session }, Vec::new(), FILE_WAIT)
+            .await?;
         Ok(())
     }
 }
@@ -501,7 +535,10 @@ fn split_chunk(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let stdout_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
     let rest = &body[4..];
     if stdout_len > rest.len() {
-        return Err(Error::Failed(Failure::new(Code::Io, "malformed chunk body")));
+        return Err(Error::Failed(Failure::new(
+            Code::Io,
+            "malformed chunk body",
+        )));
     }
     Ok((rest[..stdout_len].to_vec(), rest[stdout_len..].to_vec()))
 }
@@ -519,7 +556,9 @@ pub async fn copy(
 ) -> Result<u64, Error> {
     let mut offset = 0u64;
     loop {
-        let (total, data) = from.read(from_cwd, from_path, offset, Some(COPY_CHUNK)).await?;
+        let (total, data) = from
+            .read(from_cwd, from_path, offset, Some(COPY_CHUNK))
+            .await?;
         if data.is_empty() {
             to.write_at(to_cwd, to_path, offset, &[], true).await?;
             break;
@@ -536,7 +575,10 @@ pub async fn copy(
 
 fn unexpected(answer: &Answer) -> Error {
     let _ = answer;
-    Error::Failed(Failure::new(Code::Io, "unexpected answer kind for this request"))
+    Error::Failed(Failure::new(
+        Code::Io,
+        "unexpected answer kind for this request",
+    ))
 }
 
 struct Remote {
@@ -549,9 +591,10 @@ impl Remote {
     async fn conn(&self) -> Result<Arc<Conn>, Error> {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.as_ref()
-            && !conn.dead.load(Ordering::SeqCst) {
-                return Ok(conn.clone());
-            }
+            && !conn.dead.load(Ordering::SeqCst)
+        {
+            return Ok(conn.clone());
+        }
         let stream = transport::connect(&self.addr, &self.psk)
             .await
             .map_err(|e| Error::Unavailable(format!("cannot reach {}: {e}", self.addr)))?;
@@ -625,7 +668,10 @@ impl Conn {
             let dead = dead.clone();
             tokio::spawn(async move {
                 while let Some((header, body)) = rx.recv().await {
-                    if proto::write_frame(&mut writer, &header, &body).await.is_err() {
+                    if proto::write_frame(&mut writer, &header, &body)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

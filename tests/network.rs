@@ -51,9 +51,34 @@ async fn local_mode_full_cycle() {
         .await
         .unwrap();
     assert!(out.ok());
+    assert_eq!(out.signal, None);
+    assert_eq!(out.timed_out_ms, None);
     assert_eq!(out.stdout, "hi");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remote_exec_preserves_timeout_and_partial_output() {
+    let psk = Psk::new("exec-key-high-entropy-xxxxxxxxxxxxxxxxxxxx");
+    let addr = daemon(&psk).await;
+    let hands = Hands::remote(addr, &psk);
+    let out = hands
+        .exec(
+            None,
+            "trap 'printf done >&2; exit 0' TERM; printf before; while :; do sleep 1; done",
+            200,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.code, Some(0));
+    assert_eq!(out.signal, None);
+    assert_eq!(out.timed_out_ms, Some(200));
+    assert_eq!(out.stdout, "before");
+    assert_eq!(out.stderr, "done");
+    assert!(!out.ok());
 }
 
 #[tokio::test]
@@ -83,7 +108,10 @@ async fn wrong_key_cannot_connect() {
     let psk = Psk::new("the-real-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let addr = daemon(&psk).await;
 
-    let hands = Hands::remote(addr, &Psk::new("a-different-key-bbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    let hands = Hands::remote(
+        addr,
+        &Psk::new("a-different-key-bbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    );
     let err = hands.ping(None).await.unwrap_err();
     assert!(err.is_unavailable(), "expected Unavailable, got {err:?}");
 }
@@ -104,10 +132,14 @@ async fn copy_local_to_remote_and_back() {
     let data: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
     local.write(None, &src, &data, false, None).await.unwrap();
 
-    let n = copy(&local, None, &src, &remote, None, &on_remote).await.unwrap();
+    let n = copy(&local, None, &src, &remote, None, &on_remote)
+        .await
+        .unwrap();
     assert_eq!(n, data.len() as u64);
 
-    let n = copy(&remote, None, &on_remote, &local, None, &back).await.unwrap();
+    let n = copy(&remote, None, &on_remote, &local, None, &back)
+        .await
+        .unwrap();
     assert_eq!(n, data.len() as u64);
 
     assert_eq!(std::fs::read(&back).unwrap(), data);
@@ -119,7 +151,11 @@ async fn session_local_stream_input_and_kill() {
     let hands = Hands::local(Limits::default());
     // Echoes each stdin line back, staying alive between lines.
     let sid = hands
-        .exec_start(None, "while read line; do echo \"got:$line\"; done", Vec::new())
+        .exec_start(
+            None,
+            "while read line; do echo \"got:$line\"; done",
+            Vec::new(),
+        )
         .await
         .unwrap();
     hands.exec_input(sid, b"hello\n".to_vec()).await.unwrap();
@@ -133,7 +169,10 @@ async fn session_local_stream_input_and_kill() {
         }
         assert!(alive, "process died before echoing");
     }
-    assert!(String::from_utf8_lossy(&seen).contains("got:hello"), "{seen:?}");
+    assert!(
+        String::from_utf8_lossy(&seen).contains("got:hello"),
+        "{seen:?}"
+    );
 
     hands.exec_kill(sid).await.unwrap();
     let mut died = false;

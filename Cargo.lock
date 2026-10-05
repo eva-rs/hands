@@ -731,6 +731,7 @@ dependencies = [
  "eva",
  "eyre",
  "hkdf",
+ "libc",
  "log",
  "memchr",
  "reqwest",

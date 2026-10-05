@@ -6,13 +6,14 @@
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::limits::Limits;
 use crate::proto::{Answer, Code, Entry, Failure, Kind, Op, Request};
@@ -21,6 +22,8 @@ use crate::session::Sessions;
 /// Search window; matches on a window boundary are preserved by overlapping the
 /// next window by `pattern.len() - 1`.
 const CHUNK: usize = 1024 * 1024;
+const EXEC_TERM_GRACE: Duration = Duration::from_secs(1);
+const EXEC_IO_DRAIN: Duration = Duration::from_secs(2);
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -143,13 +146,7 @@ impl Ops {
         Ok(normal)
     }
 
-    async fn read(
-        &self,
-        cwd: Option<&str>,
-        path: &str,
-        offset: u64,
-        len: Option<u64>,
-    ) -> Outcome {
+    async fn read(&self, cwd: Option<&str>, path: &str, offset: u64, len: Option<u64>) -> Outcome {
         let path = self.resolve(cwd, path)?;
         let meta = fs::metadata(&path).await.map_err(|e| io_fail(&path, e))?;
         if meta.is_dir() {
@@ -162,7 +159,10 @@ impl Ops {
         if want > self.limits.max_read {
             return Err(Failure::new(
                 Code::TooLarge,
-                format!("read of {want} bytes exceeds max_read {}", self.limits.max_read),
+                format!(
+                    "read of {want} bytes exceeds max_read {}",
+                    self.limits.max_read
+                ),
             ));
         }
 
@@ -200,12 +200,11 @@ impl Ops {
                 ),
             ));
         }
-        if create_dirs
-            && let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| io_fail(parent, e))?;
-            }
+        if create_dirs && let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| io_fail(parent, e))?;
+        }
 
         let keep_mode = mode.or_else(|| existing_mode(&path));
         let tmp = temp_sibling(&path);
@@ -288,15 +287,23 @@ impl Ops {
             ));
         }
         if let Some(len) = response.content_length()
-            && len > cap {
-                return Err(Failure::new(
-                    Code::TooLarge,
-                    format!("body of {len} bytes exceeds {cap}"),
-                ));
-            }
+            && len > cap
+        {
+            return Err(Failure::new(
+                Code::TooLarge,
+                format!("body of {len} bytes exceeds {cap}"),
+            ));
+        }
 
         let media_type = header(&response, reqwest::header::CONTENT_TYPE)
-            .map(|value| value.split(';').next().unwrap_or_default().trim().to_owned())
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            })
             .filter(|value| !value.is_empty());
         let final_url = response.url().to_string();
         let path = if into_dir {
@@ -510,7 +517,9 @@ impl Ops {
     async fn rename(&self, cwd: Option<&str>, from: &str, to: &str) -> Outcome {
         let from = self.resolve(cwd, from)?;
         let to = self.resolve(cwd, to)?;
-        fs::rename(&from, &to).await.map_err(|e| io_fail(&from, e))?;
+        fs::rename(&from, &to)
+            .await
+            .map_err(|e| io_fail(&from, e))?;
         Ok((Answer::Done, Vec::new()))
     }
 
@@ -529,11 +538,11 @@ impl Ops {
         }
 
         let requested = if timeout_ms == 0 {
-            self.limits.exec_timeout_secs * 1000
+            self.limits.exec_timeout_secs.saturating_mul(1000)
         } else {
             timeout_ms
         };
-        let cap = self.limits.exec_max_timeout_secs * 1000;
+        let cap = self.limits.exec_max_timeout_secs.saturating_mul(1000);
         let timeout = Duration::from_millis(requested.min(cap));
 
         let mut cmd = Command::new("sh");
@@ -542,6 +551,8 @@ impl Ops {
             cmd.current_dir(expand_home(cwd));
         }
         harden(&mut cmd);
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -557,6 +568,8 @@ impl Ops {
                     cmd.current_dir(expand_home(cwd));
                 }
                 harden(&mut cmd);
+                #[cfg(unix)]
+                cmd.process_group(0);
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -568,35 +581,162 @@ impl Ops {
 
         // Feed stdin from a separate task so a large input can't deadlock against
         // the child filling its stdout pipe.
-        if let Some(mut sink) = child.stdin.take() {
+        let stdin_task = child.stdin.take().map(|mut sink| {
             tokio::spawn(async move {
                 let _ = sink.write_all(&stdin).await;
                 let _ = sink.shutdown().await;
-            });
-        }
+            })
+        });
 
-        let wait = child.wait_with_output();
-        let output = match tokio::time::timeout(timeout, wait).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(Failure::new(Code::Io, format!("exec failed: {e}"))),
-            Err(_) => {
-                return Err(Failure::new(
-                    Code::Timeout,
-                    format!("command timed out after {} ms", timeout.as_millis()),
-                ));
-            }
+        // Read both pipes while waiting; a command can fill either pipe and
+        // block before exit. Keep only the allowed prefix, but always drain.
+        let cap = usize::try_from(self.limits.max_output).unwrap_or(usize::MAX);
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let out_task = tokio::spawn(capture_exec(
+            child.stdout.take().expect("piped stdout"),
+            stdout.clone(),
+            cap,
+        ));
+        let err_task = tokio::spawn(capture_exec(
+            child.stderr.take().expect("piped stderr"),
+            stderr.clone(),
+            cap,
+        ));
+        let group_pid = child.id();
+        let mut cleanup = ExecCleanup {
+            group_pid,
+            stdin_task,
+            out_task,
+            err_task,
         };
 
-        let cap = self.limits.max_output as usize;
+        let (status, timed_out_ms) = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => (status, None),
+            Ok(Err(e)) => return Err(Failure::new(Code::Io, format!("exec failed: {e}"))),
+            Err(_) => {
+                #[cfg(unix)]
+                signal_exec_group(group_pid, libc::SIGTERM);
+                #[cfg(not(unix))]
+                let _ = child.start_kill();
+                let status = match tokio::time::timeout(EXEC_TERM_GRACE, child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(e)) => {
+                        return Err(Failure::new(Code::Io, format!("exec failed: {e}")));
+                    }
+                    Err(_) => {
+                        #[cfg(unix)]
+                        signal_exec_group(group_pid, libc::SIGKILL);
+                        let _ = child.start_kill();
+                        child.wait().await.map_err(|e| {
+                            Failure::new(Code::Io, format!("exec failed after timeout: {e}"))
+                        })?
+                    }
+                };
+                (status, Some(timeout.as_millis() as u64))
+            }
+        };
+        if let Some(stdin_task) = cleanup.stdin_task.take() {
+            stdin_task.abort();
+        }
+        // The shell may exit after TERM while a child still holds a pipe.
+        #[cfg(unix)]
+        if timed_out_ms.is_some() {
+            signal_exec_group(group_pid, libc::SIGKILL);
+        }
+        // A grandchild may keep a pipe open after the shell exits. Preserve
+        // everything observed so far and bound the post-exit drain.
+        let drain = async {
+            let _ = tokio::join!(&mut cleanup.out_task, &mut cleanup.err_task);
+        };
+        if tokio::time::timeout(EXEC_IO_DRAIN, drain).await.is_err() {
+            #[cfg(unix)]
+            signal_exec_group(group_pid, libc::SIGKILL);
+            cleanup.out_task.abort();
+            cleanup.err_task.abort();
+        }
+        let stdout = clamp(&stdout.lock().unwrap(), cap);
+        let stderr = clamp(&stderr.lock().unwrap(), cap);
+        cleanup.group_pid = None;
         Ok((
             Answer::Exec {
-                code: output.status.code(),
-                stdout: clamp(&output.stdout, cap),
-                stderr: clamp(&output.stderr, cap),
+                code: status.code(),
+                signal: exit_signal(&status),
+                timed_out_ms,
+                stdout,
+                stderr,
             },
             Vec::new(),
         ))
     }
+}
+
+/// Synchronous cleanup also runs when a caller drops the exec future. The
+/// child itself has `kill_on_drop`; the guard covers its process group and
+/// detached pipe/stdin tasks.
+struct ExecCleanup {
+    group_pid: Option<u32>,
+    stdin_task: Option<JoinHandle<()>>,
+    out_task: JoinHandle<()>,
+    err_task: JoinHandle<()>,
+}
+
+impl Drop for ExecCleanup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        signal_exec_group(self.group_pid, libc::SIGKILL);
+        if let Some(task) = &self.stdin_task {
+            task.abort();
+        }
+        self.out_task.abort();
+        self.err_task.abort();
+    }
+}
+
+async fn capture_exec<R: AsyncRead + Unpin>(mut reader: R, saved: Arc<Mutex<Vec<u8>>>, cap: usize) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut saved = saved.lock().unwrap();
+                let keep = n.min(cap.saturating_sub(saved.len()));
+                saved.extend_from_slice(&chunk[..keep]);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_exec_group(pid: Option<u32>, signal: i32) {
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        // The shell is its own process group; a negative PID reaches its
+        // children as well. The child is separately killed/reaped as a fallback.
+        unsafe { libc::kill(-pid, signal) };
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| match signal {
+        libc::SIGHUP => "SIGHUP".to_owned(),
+        libc::SIGINT => "SIGINT".to_owned(),
+        libc::SIGQUIT => "SIGQUIT".to_owned(),
+        libc::SIGILL => "SIGILL".to_owned(),
+        libc::SIGABRT => "SIGABRT".to_owned(),
+        libc::SIGFPE => "SIGFPE".to_owned(),
+        libc::SIGKILL => "SIGKILL".to_owned(),
+        libc::SIGSEGV => "SIGSEGV".to_owned(),
+        libc::SIGTERM => "SIGTERM".to_owned(),
+        libc::SIGPIPE => "SIGPIPE".to_owned(),
+        other => format!("SIG{other}"),
+    })
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
+    None
 }
 
 pub(crate) fn harden(cmd: &mut Command) {
@@ -724,9 +864,10 @@ pub(crate) fn expand_home(path: &str) -> PathBuf {
             return PathBuf::from(home);
         }
     } else if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(rest);
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return Path::new(&home).join(rest);
+    }
     PathBuf::from(path)
 }
 
@@ -753,9 +894,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let name = format!(
         ".eva-hands.{pid}.{seq}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
     );
     match path.parent() {
         Some(parent) => parent.join(name),
@@ -777,7 +916,9 @@ fn existing_mode(path: &Path) -> Option<u32> {
 }
 
 async fn entry_at(path: &Path) -> Result<Entry, Failure> {
-    let meta = fs::symlink_metadata(path).await.map_err(|e| io_fail(path, e))?;
+    let meta = fs::symlink_metadata(path)
+        .await
+        .map_err(|e| io_fail(path, e))?;
     let file_type = meta.file_type();
     let (kind, size, target) = if file_type.is_symlink() {
         let target = fs::read_link(path).await.ok();
@@ -799,11 +940,18 @@ async fn entry_at(path: &Path) -> Result<Entry, Failure> {
     let mtime = meta
         .modified()
         .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64))
-        .or_else(|| {
-            meta.modified()
+        .and_then(|t| {
+            t.duration_since(UNIX_EPOCH)
                 .ok()
-                .and_then(|t| UNIX_EPOCH.duration_since(t).ok().map(|d| -(d.as_secs() as i64)))
+                .map(|d| d.as_secs() as i64)
+        })
+        .or_else(|| {
+            meta.modified().ok().and_then(|t| {
+                UNIX_EPOCH
+                    .duration_since(t)
+                    .ok()
+                    .map(|d| -(d.as_secs() as i64))
+            })
         });
 
     Ok(Entry {
@@ -913,7 +1061,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(answer, Answer::Read { total: 5000, offset: 1000 }));
+        assert!(matches!(
+            answer,
+            Answer::Read {
+                total: 5000,
+                offset: 1000
+            }
+        ));
         assert_eq!(body, vec![7u8; 100]);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -947,7 +1101,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(answer, Answer::Read { total: 5, offset: 5 }));
+        assert!(matches!(
+            answer,
+            Answer::Read {
+                total: 5,
+                offset: 5
+            }
+        ));
         assert!(body.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1014,7 +1174,9 @@ mod tests {
         .await
         .unwrap();
         match answer {
-            Answer::Find { offsets, stopped, .. } => {
+            Answer::Find {
+                offsets, stopped, ..
+            } => {
                 assert_eq!(offsets, vec![0, 4, 8]);
                 assert!(!stopped);
             }
@@ -1033,7 +1195,9 @@ mod tests {
         .await
         .unwrap();
         match answer {
-            Answer::Find { offsets, stopped, .. } => {
+            Answer::Find {
+                offsets, stopped, ..
+            } => {
                 assert_eq!(offsets, vec![0, 4]);
                 assert!(stopped);
             }
@@ -1056,8 +1220,16 @@ mod tests {
         .await
         .unwrap();
         match answer {
-            Answer::Exec { code, stdout, .. } => {
+            Answer::Exec {
+                code,
+                signal,
+                timed_out_ms,
+                stdout,
+                ..
+            } => {
                 assert_eq!(code, Some(0));
+                assert_eq!(signal, None);
+                assert_eq!(timed_out_ms, None);
                 assert_eq!(stdout, "piped");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1070,13 +1242,170 @@ mod tests {
         let result = run(
             &ops,
             Op::Exec {
-                command: "sleep 5".into(),
+                command: "printf before; printf error >&2; sleep 5".into(),
                 timeout_ms: 200,
             },
             Vec::new(),
         )
         .await;
-        assert_eq!(result.unwrap_err().code, Code::Timeout);
+        let (answer, _) = result.unwrap();
+        let Answer::Exec {
+            code,
+            signal,
+            timed_out_ms,
+            stdout,
+            stderr,
+        } = answer
+        else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        assert_eq!(code, None);
+        assert!(matches!(signal.as_deref(), Some("SIGTERM" | "SIGKILL")));
+        assert_eq!(timed_out_ms, Some(200));
+        assert_eq!(stdout, "before");
+        assert_eq!(stderr, "error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_signal_is_separate_from_exit_code() {
+        let (answer, _) = run(
+            &ops(),
+            Op::Exec {
+                command: "kill -TERM $$".into(),
+                timeout_ms: 5000,
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let Answer::Exec {
+            code,
+            signal,
+            timed_out_ms,
+            ..
+        } = answer
+        else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        assert_eq!(code, None);
+        assert_eq!(signal.as_deref(), Some("SIGTERM"));
+        assert_eq!(timed_out_ms, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_trapped_timeout_can_exit_zero() {
+        let (answer, _) = run(
+            &ops(),
+            Op::Exec {
+                command:
+                    "trap 'printf trapped; exit 0' TERM; printf before; while :; do sleep 1; done"
+                        .into(),
+                timeout_ms: 200,
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let Answer::Exec {
+            code,
+            signal,
+            timed_out_ms,
+            stdout,
+            ..
+        } = answer
+        else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        assert_eq!(code, Some(0));
+        assert_eq!(signal, None);
+        assert_eq!(timed_out_ms, Some(200));
+        assert_eq!(stdout, "beforetrapped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_trap_cleans_descendant_holding_output_pipe() {
+        let dir = temp_dir();
+        let marker = dir.join("survived");
+        let command = format!(
+            "trap 'exit 0' TERM; (trap '' TERM; sleep 2; printf survived > '{}') & printf ready; while :; do sleep 1; done",
+            marker.display()
+        );
+        let (answer, _) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            run(
+                &ops(),
+                Op::Exec {
+                    command,
+                    timeout_ms: 200,
+                },
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("timed-out exec waited for a descendant's pipe")
+        .unwrap();
+        let Answer::Exec {
+            code,
+            timed_out_ms,
+            stdout,
+            ..
+        } = answer
+        else {
+            panic!("unexpected answer: {answer:?}");
+        };
+        assert_eq!(code, Some(0));
+        assert_eq!(timed_out_ms, Some(200));
+        assert_eq!(stdout, "ready");
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(!marker.exists(), "a descendant survived the timeout");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_exec_future_kills_its_process_group() {
+        let dir = temp_dir();
+        let marker = dir.join("pid");
+        let command = format!("printf '%s' $$ > '{}'; sleep 10", marker.display());
+        let ops = Arc::new(ops());
+        let task = tokio::spawn(async move {
+            run(
+                &ops,
+                Op::Exec {
+                    command,
+                    timeout_ms: 30_000,
+                },
+                Vec::new(),
+            )
+            .await
+        });
+        let pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&marker) {
+                    break text.parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let alive = unsafe { libc::kill(-pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exec process group survived cancelled future");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -1143,9 +1472,13 @@ mod tests {
         )
         .await;
 
-        let (answer, _) = run(&ops(), fetch(format!("{base}/x.pdf"), path.clone(), 0), Vec::new())
-            .await
-            .unwrap();
+        let (answer, _) = run(
+            &ops(),
+            fetch(format!("{base}/x.pdf"), path.clone(), 0),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         match answer {
             Answer::Fetched {
                 total,
@@ -1174,9 +1507,13 @@ mod tests {
         )
         .await;
 
-        let (answer, _) = run(&ops(), fetch(format!("{base}/raw?id=7"), into, 0), Vec::new())
-            .await
-            .unwrap();
+        let (answer, _) = run(
+            &ops(),
+            fetch(format!("{base}/raw?id=7"), into, 0),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         let Answer::Fetched { path, .. } = answer else {
             panic!("unexpected answer: {answer:?}");
         };
@@ -1205,7 +1542,12 @@ mod tests {
         let path = dir.join("big.bin").to_string_lossy().into_owned();
         let base = http_once("200 OK", "", vec![7u8; 4096]).await;
 
-        let result = run(&ops(), fetch(format!("{base}/big.bin"), path, 100), Vec::new()).await;
+        let result = run(
+            &ops(),
+            fetch(format!("{base}/big.bin"), path, 100),
+            Vec::new(),
+        )
+        .await;
         assert_eq!(result.unwrap_err().code, Code::TooLarge);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -1217,7 +1559,12 @@ mod tests {
         let path = dir.join("gone.bin").to_string_lossy().into_owned();
         let base = http_once("404 Not Found", "Content-Length: 0\r\n", Vec::new()).await;
 
-        let result = run(&ops(), fetch(format!("{base}/gone.bin"), path, 0), Vec::new()).await;
+        let result = run(
+            &ops(),
+            fetch(format!("{base}/gone.bin"), path, 0),
+            Vec::new(),
+        )
+        .await;
         assert_eq!(result.unwrap_err().code, Code::NotFound);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1231,7 +1578,12 @@ mod tests {
         });
         let outside = dir.join("elsewhere/f").to_string_lossy().into_owned();
 
-        let result = run(&ops, fetch("http://127.0.0.1:1/x".into(), outside, 0), Vec::new()).await;
+        let result = run(
+            &ops,
+            fetch("http://127.0.0.1:1/x".into(), outside, 0),
+            Vec::new(),
+        )
+        .await;
         assert_eq!(result.unwrap_err().code, Code::Denied);
         std::fs::remove_dir_all(&dir).ok();
     }

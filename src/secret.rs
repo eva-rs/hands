@@ -46,7 +46,10 @@ impl fmt::Debug for Psk {
 impl PartialEq for Psk {
     fn eq(&self, other: &Self) -> bool {
         let (a, b) = (self.derive32(), other.derive32());
-        a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
     }
 }
 

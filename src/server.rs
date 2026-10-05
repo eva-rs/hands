@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::ops::{Ops, hostname};
-use crate::proto::{self, Answer, Failure, Reply, Request, Response, PROTOCOL};
+use crate::proto::{self, Answer, Failure, PROTOCOL, Reply, Request, Response};
 
 /// Cap on operations running at once, so a burst of requests can't spawn
 /// unbounded work.
@@ -23,7 +23,10 @@ where
 
     let writer_task = tokio::spawn(async move {
         while let Some((header, body)) = rx.recv().await {
-            if proto::write_frame(&mut writer, &header, &body).await.is_err() {
+            if proto::write_frame(&mut writer, &header, &body)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
