@@ -1,7 +1,7 @@
 {
   description = "Eva's hands: file and process operations, in-process or over an encrypted channel";
 
-  inputs.eva.url = "git+https://git.desu.church/VienDesu/eva.git";
+  inputs.eva.url = "git+ssh://git@github.com/nerodono/eva.git";
 
   outputs = { self, eva, ... }:
     eva.lib.mkServiceFlake {

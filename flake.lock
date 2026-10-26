@@ -23,17 +23,17 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1787562793,
-        "narHash": "sha256-4KSPt3sKG+Pf4i1sFoIpjd8vntm9a63Ly9AU/vRefZ8=",
+        "lastModified": 1793003448,
+        "narHash": "sha256-tpzH6zsQ4tWsoZrW3IQRZPiJxb8Y6eIHTjTeW1VsCY0=",
         "ref": "refs/heads/master",
-        "rev": "504eb3f2df24618ef4e0fc04168ef8ffd4a086e7",
-        "revCount": 24,
+        "rev": "fa4883ea2831db679c684eb8dcef13fd7578af64",
+        "revCount": 1,
         "type": "git",
-        "url": "https://git.desu.church/VienDesu/eva.git"
+        "url": "ssh://git@github.com/nerodono/eva.git"
       },
       "original": {
         "type": "git",
-        "url": "https://git.desu.church/VienDesu/eva.git"
+        "url": "ssh://git@github.com/nerodono/eva.git"
       }
     },
     "fenix": {
@@ -78,16 +78,18 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1787360063,
-        "narHash": "sha256-95aJfHyQTLWslCXFVNB0odgmVkpdmDezQwTg9mhqV1E=",
-        "rev": "2c423e03bbafcff28bfadc6781a4a8257f205cb5",
-        "type": "tarball",
-        "url": "https://releases.nixos.org/nixos/unstable/nixos-26.11pre1059570.2c423e03bbaf/nixexprs.tar.xz"
+        "lastModified": 1790635395,
+        "narHash": "sha256-bNyvoIyOCu7lzoCpWKWGIsHpTtERUWzqYWFPlN++WTw=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "7fc6f2c20af09cdcaf48b92ec3121860139ec668",
+        "type": "github"
       },
       "original": {
-        "id": "nixpkgs",
-        "ref": "nixos-unstable",
-        "type": "indirect"
+        "owner": "nixos",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
       }
     },
     "root": {

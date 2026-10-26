@@ -60,7 +60,7 @@ rename), `write_at`, `fetch` (скачать URL прямо на машину �
 
 ## Запуск демона
 
-Бутстрап на фреймворке [eva](https://git.desu.church/VienDesu/eva): `eva::cli::App` для
+Бутстрап на фреймворке [eva](https://github.com/nerodono/eva): `eva::cli::App` для
 конфигурации и `eva::supervisor::Supervisor` для graceful-остановки.
 
 ```
