@@ -23,11 +23,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1793831140,
-        "narHash": "sha256-iOjzyeFfSg/8E9+L3PixzukDo7ZJaGkuox+ilAAoN0M=",
+        "lastModified": 1793831870,
+        "narHash": "sha256-0Sg7SVAoqBttWq8gT21dhNia/sZQhxcBQkl6orT0Dg8=",
         "ref": "refs/heads/master",
-        "rev": "27da5b26fe345733d8d77e12a598d0f8e05a8917",
-        "revCount": 7,
+        "rev": "d0f9af1b464e8195ca4ead427cdfbcf3e12a73a8",
+        "revCount": 8,
         "type": "git",
         "url": "ssh://git@github.com/nerodono/eva.git"
       },
@@ -78,16 +78,16 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1790635395,
-        "narHash": "sha256-bNyvoIyOCu7lzoCpWKWGIsHpTtERUWzqYWFPlN++WTw=",
+        "lastModified": 1793726008,
+        "narHash": "sha256-jQp1wKvbwWdLBASTXkSi/VYmDJ5AbBi1WvcMt9HWJC8=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "7fc6f2c20af09cdcaf48b92ec3121860139ec668",
+        "rev": "1d060086d60cb76a40cf37109f979d88a5bd6396",
         "type": "github"
       },
       "original": {
         "owner": "nixos",
-        "ref": "nixos-26.05",
+        "ref": "nixos-unstable",
         "repo": "nixpkgs",
         "type": "github"
       }
