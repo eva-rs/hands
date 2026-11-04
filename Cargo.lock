@@ -350,7 +350,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -552,41 +552,77 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "eva"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#fa4883ea2831db679c684eb8dcef13fd7578af64"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+dependencies = [
+ "eva-core",
+ "eva-rt",
+]
+
+[[package]]
+name = "eva-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
 dependencies = [
  "ahash",
  "blake3",
  "bytes",
  "bytesize",
- "clap",
  "compact_str",
  "either",
- "eva-macros",
+ "eva-core-macros",
+ "eva-data",
  "eva-utils",
- "eyre",
- "fastrace",
- "figment",
  "hashbrown",
  "humantime",
- "log",
- "logforth",
  "paste",
  "perfect-derive",
- "pin-project-lite",
  "rand 0.9.5",
  "rand_xoshiro",
  "schemars",
  "seq-macro",
  "serde",
- "tokio",
  "trait-set",
  "url",
+]
+
+[[package]]
+name = "eva-core-macros"
+version = "0.1.0"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+dependencies = [
+ "eva-macros-common",
+]
+
+[[package]]
+name = "eva-data"
+version = "0.1.0"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+dependencies = [
+ "compact_str",
+ "eva-data-macros",
+ "perfect-derive",
+ "rand 0.9.5",
+ "schemars",
+ "serde",
+ "trait-set",
+]
+
+[[package]]
+name = "eva-data-macros"
+version = "0.1.0"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+dependencies = [
+ "eva-macros-common",
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -612,20 +648,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "eva-macros"
+name = "eva-macros-common"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#fa4883ea2831db679c684eb8dcef13fd7578af64"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
 dependencies = [
- "heck",
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
 ]
 
 [[package]]
+name = "eva-rt"
+version = "0.1.0"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+dependencies = [
+ "clap",
+ "compact_str",
+ "eva-core",
+ "eyre",
+ "fastrace",
+ "figment",
+ "log",
+ "logforth",
+ "pin-project-lite",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "eva-utils"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#fa4883ea2831db679c684eb8dcef13fd7578af64"
+source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
 
 [[package]]
 name = "eyre"
@@ -690,6 +744,7 @@ dependencies = [
  "pear",
  "serde",
  "serde_json",
+ "serde_yaml",
  "toml",
  "uncased",
  "version_check",
@@ -1494,6 +1549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-crate"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+dependencies = [
+ "toml_edit 0.25.18+spec-1.1.0",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1568,7 +1632,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1955,6 +2019,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2273,8 +2350,8 @@ checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
  "serde",
  "serde_spanned",
- "toml_datetime",
- "toml_edit",
+ "toml_datetime 0.6.11",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -2287,6 +2364,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_datetime"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "toml_edit"
 version = "0.22.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2295,9 +2381,30 @@ dependencies = [
  "indexmap",
  "serde",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 0.6.11",
  "toml_write",
- "winnow",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.18+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ec6e78bd70db9420d8d212fa9dc97f116448a1ceff5d00eabb991d407e21396"
+dependencies = [
+ "indexmap",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "winnow 1.0.4",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+dependencies = [
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -2423,6 +2530,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -2699,6 +2812,15 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]

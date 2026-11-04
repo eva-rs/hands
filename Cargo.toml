@@ -14,10 +14,10 @@ required-features = ["bin"]
 
 [features]
 default = ["bin"]
-bin = ["dep:clap", "dep:base64", "eva/cli", "eva/tokio"]
+bin = ["dep:clap", "dep:base64", "eva/cli", "eva/logforth", "eva/yaml"]
 
 [dependencies]
-eva = { git = "ssh://git@github.com/nerodono/eva.git" }
+eva = { git = "ssh://git@github.com/nerodono/eva.git", default-features = false }
 eyre = "0.6"
 
 tokio = { version = "1", features = [

@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use eva::cli::{App, NoArgs};
-use eva::component_configs::{ComponentConfig, ComponentConfigs};
-use eva::supervisor::{Command, SlaveRx, Supervisor};
+use eva::rt::cfg::{ComponentConfig, ComponentConfigs};
+use eva::rt::cli::{self, NoArgs};
+use eva::rt::components::{Command, SlaveRx};
+use eva::rt::{Components, Runtime};
 use eyre::Context;
 use tokio::net::TcpListener;
 
@@ -28,19 +29,21 @@ fn default_listen() -> String {
 
 fn main() -> eyre::Result<()> {
     // `keygen` produces a key and exits — it must not require a config or a key,
-    // so it runs before the config-loading App.
+    // so it runs before the config-loading runtime.
     if std::env::args().skip(1).any(|a| a == "keygen") {
         return keygen();
     }
 
-    App::default()
-        .env_prefix("EVA_")
-        .require::<HandsConfig>("hands")
-        .run(serve)
+    cli::run(
+        Runtime::default()
+            .env_prefix("EVA_")
+            .require::<HandsConfig>("hands"),
+        serve,
+    )
 }
 
 async fn serve(_: NoArgs, configs: ComponentConfigs) -> eyre::Result<()> {
-    Supervisor::new(configs)
+    Components::new(configs)
         .add::<HandsConfig>(listen)
         .wait_for_completion()
         .await
