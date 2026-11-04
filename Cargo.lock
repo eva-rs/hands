@@ -558,7 +558,7 @@ dependencies = [
 [[package]]
 name = "eva"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "eva-core",
  "eva-rt",
@@ -567,7 +567,7 @@ dependencies = [
 [[package]]
 name = "eva-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "ahash",
  "blake3",
@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "eva-core-macros"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "eva-macros-common",
 ]
@@ -602,7 +602,7 @@ dependencies = [
 [[package]]
 name = "eva-data"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "compact_str",
  "eva-data-macros",
@@ -616,7 +616,7 @@ dependencies = [
 [[package]]
 name = "eva-data-macros"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "eva-macros-common",
  "heck",
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "eva-macros-common"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -661,7 +661,7 @@ dependencies = [
 [[package]]
 name = "eva-rt"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 dependencies = [
  "clap",
  "compact_str",
@@ -679,7 +679,7 @@ dependencies = [
 [[package]]
 name = "eva-utils"
 version = "0.1.0"
-source = "git+ssh://git@github.com/nerodono/eva.git#27da5b26fe345733d8d77e12a598d0f8e05a8917"
+source = "git+ssh://git@github.com/nerodono/eva.git#05944405c8432bcdcc3255ed6113b2eb45a692e0"
 
 [[package]]
 name = "eyre"

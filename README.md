@@ -61,7 +61,7 @@ rename), `write_at`, `fetch` (скачать URL прямо на машину �
 ## Запуск демона
 
 Бутстрап на фреймворке [eva](https://github.com/nerodono/eva): `eva::rt::Runtime` для
-конфигурации и запуска через `eva::rt::cli::run`, `eva::rt::Components` для graceful-остановки.
+конфигурации и запуска с разбором CLI, `eva::rt::Components` для graceful-остановки.
 
 ```
 eva-hands --config hands.yaml

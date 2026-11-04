@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use eva::rt::cfg::{ComponentConfig, ComponentConfigs};
-use eva::rt::cli::{self, NoArgs};
+use eva::rt::cli::NoArgs;
 use eva::rt::components::{Command, SlaveRx};
 use eva::rt::{Components, Runtime};
 use eyre::Context;
@@ -34,12 +34,9 @@ fn main() -> eyre::Result<()> {
         return keygen();
     }
 
-    cli::run(
-        Runtime::default()
-            .env_prefix("EVA_")
-            .require::<HandsConfig>("hands"),
-        serve,
-    )
+    Runtime::default()
+        .configure(|cfg| cfg.env_prefix("EVA_").required::<HandsConfig>("hands"))
+        .run(serve)
 }
 
 async fn serve(_: NoArgs, configs: ComponentConfigs) -> eyre::Result<()> {

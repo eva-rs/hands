@@ -23,11 +23,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1793831870,
-        "narHash": "sha256-0Sg7SVAoqBttWq8gT21dhNia/sZQhxcBQkl6orT0Dg8=",
+        "lastModified": 1793833751,
+        "narHash": "sha256-ffVo3v5dzz0F2L3q6Ao5W14bKZ8SX8I2JbZ38qQ/aXk=",
         "ref": "refs/heads/master",
-        "rev": "d0f9af1b464e8195ca4ead427cdfbcf3e12a73a8",
-        "revCount": 8,
+        "rev": "05944405c8432bcdcc3255ed6113b2eb45a692e0",
+        "revCount": 9,
         "type": "git",
         "url": "ssh://git@github.com/nerodono/eva.git"
       },
